@@ -15,7 +15,7 @@
 
 `vehicle.js` 根据车辆仪表模式切换布局，通过 cluster-render 的 `widget` 图片图层显示。`vehicle-data.js` 只读取 SOME/IP 温度、胎压和加速度信号，不发送 OBD / UDS 诊断请求。
 
-配合本地 cluster-render 的 layout-focus-v2（300 毫秒）后，用户已确认模式切换能够恢复。该服务改动单独保存在 idrive-apps 仓库。v2.3 增加 Lifecycle.powerStateDetailed 的 Front 实例只读订阅，并通过 wakeWidget() 通知对应的本地 ID8 服务处理点火恢复；车端还需 Lifecycle 的 SOME/IP 配置。实际锁车恢复仍在验证。
+配合本地 cluster-render 的 layout-focus-v2（300 毫秒）后，用户已确认模式切换能够恢复。该服务改动单独保存在 idrive-apps 仓库。v2.3 增加 Lifecycle.powerStateDetailed 的 Front 实例只读订阅，并通过 wakeWidget() 通知对应的本地 ID8 服务处理点火恢复；车端还需 Lifecycle 的 SOME/IP 配置。用户已确认 v2.3 本轮锁车点火恢复测试通过。
 
 ## 文件与依赖
 
