@@ -8,12 +8,13 @@ const { ClusterRender } = require('/var/opt/cluster-render/current/cluster_rende
 const { VehicleData, definitions } = require('./vehicle-data');
 const { render } = require('./render');
 const layouts = {
-    road: { x: 805, y: 125, w: 630, h: 570 },
-    sport: { x: 814, y: 170, w: 612, h: 527 }
+    road: { x: 620, y: 125, w: 1000, h: 570 },
+    sport: { x: 720, y: 170, w: 800, h: 527 }
 };
 const data = new VehicleData(), subscriptions = [], log = { info: console.log, warn: console.error };
 const cr = new ClusterRender('87-arcade');
 let mode = null, modeAt = 0, ref = null, shape = '', stopping = false, canvas;
+let wakePending = false;
 cr.on('error', e => console.error(String(e)));
 cr.on('ready', () => console.log('renderer ready', cr.targets));
 cr.on('target', (target, state, holder, reason) => console.log('target', target, state, reason || ''));
@@ -32,8 +33,19 @@ async function start() {
             modeAt = Date.now();
         }
     };
+    byInterface['de.bmw.infotainment.lifecycle.lifecycle.Lifecycle'] = {
+        powerStateDetailed: state => {
+            if (['WELCOME_SCREEN', 'GOODBYE_SCREEN', 'SHUTDOWN_MODE_USER_OFF', 'SLEEP_MODE_ALL_OFF'].indexOf(state) >= 0)
+                wakePending = true;
+            if (state === 'FULL_ON_USER_ON' && wakePending) {
+                wakePending = false;
+                console.log('ignition wake: request widget recovery');
+                cr.wakeWidget();
+            }
+        }
+    };
     for (const iface of Object.keys(byInterface)) {
-        const sub = await signals.watch(iface, '1', byInterface[iface], log, { pollMs: /CDS2$/.test(iface) ? 500 : /TPMS$/.test(iface) ? 10000 : 2000 });
+        const sub = await signals.watch(iface, /\.Lifecycle$/.test(iface) ? 'Front' : '1', byInterface[iface], log, { pollMs: /CDS2$/.test(iface) ? 500 : /TPMS$/.test(iface) ? 10000 : 2000 });
         subscriptions.push(sub);
         if (sub.error) throw Error(iface + ': ' + sub.error);
     }
