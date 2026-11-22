@@ -48,6 +48,8 @@ IDRIVE_APPS=/path/to/idrive-apps IDRIVE7_APPS=/path/to/idrive7-apps node vehicle
 
 ## 2026-11-22 车端更新与发现
 
+本次持久化遗漏的模型记录、原因、披露情况和验收教训见 [选择记忆错误复盘](docs/POSTMORTEM-20261122.md)。v2.3 编写与交付回合的模型元数据为 `gpt-6.1-sol`。
+
 旧 v2.3 把选择保存在内存。短时锁车测试通过不能证明整车完整休眠后恢复，之前把这项功能视为完成是验收遗漏。此次启动日志显示组件已注册，但切换模式时报告 no recorded selection，恢复请求未发出。
 
 本次已部署公共 manager/runtime/lifecycle、稳定组件注册、持久选择和完整 Logo 缩略图。沿用已登记的自启服务，将其入口改为 manager，未同时启动旧单组件入口。新进程加载两个模式的选择，300ms 后请求显示，并收到 DCSM shown。注册与选择文件分开保存，后续组件共用恢复机制。
