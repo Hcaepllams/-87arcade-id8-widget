@@ -1,0 +1,16 @@
+[Unit]
+Description=ID8 widget manager
+RequiresMountsFor=/var/opt
+Wants=cluster-render.socket
+After=local-fs.target cluster-render.socket hmi8.service
+
+[Service]
+Type=simple
+EnvironmentFile=/var/opt/id8-widgets/runtime.env
+ExecStart=/usr/bin/node /var/opt/id8-widgets/current/manager.js /var/opt/id8-widgets/apps /var/opt/id8-widgets/state/registry.json
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

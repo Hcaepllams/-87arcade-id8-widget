@@ -1,8 +1,10 @@
 {
   "id": "club-dashboard",
-  "title": "87 ARCADE · Club instruments",
+  "title": "87 Arcade",
   "version": "0.1.0-preview",
   "target": "widget",
   "entry": "render.js",
-  "description": "ROAD: tyre pressures and temperatures. M SPORT: G-force. Both: club logo, oil and coolant temperatures."
+  "description": "ROAD: tyre pressures and temperatures. M SPORT: G-force. Both: club logo, oil and coolant temperatures.",
+  "preview": "assets/preview.png",
+  "vehicle": "widget.js"
 }

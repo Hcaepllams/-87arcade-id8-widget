@@ -1,0 +1,841 @@
+diff --git a/native/cluster-render/PROTOCOL.md b/native/cluster-render/PROTOCOL.md
+index 91cc50b..524194d 100644
+--- a/native/cluster-render/PROTOCOL.md
++++ b/native/cluster-render/PROTOCOL.md
+@@ -216,3 +216,8 @@ that `reason`.
+ 
+ A client that does not read its events (over 1 MiB waiting) is
+ disconnected.
++
++
++### ID8 widget wake extension
++
++The local ID8 build accepts `{"op":"widget-wake"}` from a connected vehicle-data client after a real wake cycle enters FULL_ON_USER_ON. It rearms an existing selected-widget request after 300 ms, including when no content size update arrives. It does not select a widget that has never been shown in this service session. The JS client exposes `wakeWidget()`. Older and ID7 servers do not implement this extension.
+diff --git a/native/cluster-render/cluster-render.conf b/native/cluster-render/cluster-render.conf
+index 17a5b35..6920217 100644
+--- a/native/cluster-render/cluster-render.conf
++++ b/native/cluster-render/cluster-render.conf
+@@ -238,9 +238,9 @@ id8_widget_content = 43204001
+ id8_widget_scene_id = 0x4d4755000001
+ id8_widget_size = 2240x896
+ id8_widget_linger_ms = 3000
+-id8_widget_description = Cluster renderer
++id8_widget_description = 87 Arcade
+ id8_widget_order = 50
+-id8_widget_preview =
++id8_widget_preview = /var/opt/club-dashboard-preview-20261107/club-dashboard/assets/preview.png
+ # A widget's background, the cluster views it is shown in, and whether it
+ # asks to be shown (VERIFIED on the car, an M4 in its ROAD view, with
+ # icwidget making the same calls): background_id 43400001, 43400004,
+@@ -254,6 +254,9 @@ id8_widget_preview =
+ id8_widget_background_id =
+ id8_widget_layouts =
+ id8_widget_focus = 0
++# Experimental: restore a previously selected layout after 300 ms, hold focus until exit.
++# Off by default; does not restore the selection after a reboot.
++id8_widget_restore_on_layout = 0
+ # The pop-up: a second widget, which the cluster shows by itself while a
+ # client draws on it (focus 1) on a black middle (background 43400005); its
+ # menu entry lists it too. The part of its canvas a big picture fits best:
+diff --git a/native/cluster-render/js/cluster_render_client.js b/native/cluster-render/js/cluster_render_client.js
+index ddcca57..ab97bdb 100644
+--- a/native/cluster-render/js/cluster_render_client.js
++++ b/native/cluster-render/js/cluster_render_client.js
+@@ -531,6 +531,8 @@ class ClusterRender extends EventEmitter {
+         return true;
+     }
+ 
++    wakeWidget() { this._send({ op: 'widget-wake' }); }
++
+     status() { this._send({ op: 'status' }); }
+ }
+ 
+diff --git a/native/cluster-render/src/config.cpp b/native/cluster-render/src/config.cpp
+index 0648248..f48d466 100644
+--- a/native/cluster-render/src/config.cpp
++++ b/native/cluster-render/src/config.cpp
+@@ -58,6 +58,20 @@ void Config::define(const char *key, const char *def)
+ bool Config::set(const std::string &key, const std::string &value, std::string *err)
+ {
+     auto it = values_.find(key);
++    if (it == values_.end() && key.compare(0, 4, "id8_") == 0) {
++        const char *fields[] = {"category", "content", "scene_id", "size", "linger_ms", "description",
++                                "order", "preview", "background_id", "layouts", "focus", "remember"};
++        for (const char *field : fields) {
++            const std::string suffix = "_" + std::string(field);
++            if (key.size() <= 4 + suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0)
++                continue;
++            const std::string name = key.substr(4, key.size() - 4 - suffix.size());
++            if (name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789") == std::string::npos) {
++                it = values_.emplace(key, "").first;
++                break;
++            }
++        }
++    }
+     if (it == values_.end()) {
+         *err = "unknown setting " + key;
+         return false;
+diff --git a/native/cluster-render/src/dcsm27_port.cpp b/native/cluster-render/src/dcsm27_port.cpp
+index f24d23a..f571257 100644
+--- a/native/cluster-render/src/dcsm27_port.cpp
++++ b/native/cluster-render/src/dcsm27_port.cpp
+@@ -4,14 +4,56 @@
+ 
+ #include "log.h"
+ 
++#include <fcntl.h>
++#include <unistd.h>
++#include <cstdio>
++#include <fstream>
++#include <sstream>
++
+ namespace crs {
+ 
+ namespace {
+ 
+ unsigned long long u(uint64_t v) { return (unsigned long long)v; }
++bool remembered(const TargetSpec &t) { return t.remember || t.name == "widget"; }
+ 
+ }  // namespace
+ 
++void Dcsm27Port::load_widget_selection(const std::string &path)
++{
++    selection_path_ = path;
++    std::ifstream in(path);
++    uint32_t layout;
++    uint64_t content;
++    while (in >> layout >> content)
++        selections_[layout] = content;
++    log_info("widget-restore: loaded %u layout selections", (unsigned)selections_.size());
++}
++
++void Dcsm27Port::save_widget_selection() const
++{
++    if (selection_path_.empty())
++        return;
++    std::ostringstream text;
++    for (const auto &kv : selections_)
++        text << kv.first << ' ' << kv.second << '\n';
++    const std::string data = text.str(), tmp = selection_path_ + ".tmp";
++    const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++    const bool whole = fd >= 0 && write(fd, data.data(), data.size()) == (ssize_t)data.size() && fsync(fd) == 0;
++    if (fd >= 0) close(fd);
++    if (!whole || rename(tmp.c_str(), selection_path_.c_str()) != 0) {
++        unlink(tmp.c_str());
++        log_warn("widget-restore: cannot save selection to %s", selection_path_.c_str());
++        return;
++    }
++    const std::string dir = selection_path_.substr(0, selection_path_.find_last_of('/') + 1);
++    const int dfd = open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    if (dfd >= 0) {
++        fsync(dfd);
++        close(dfd);
++    }
++}
++
+ bool Dcsm27Port::offer(Content &c)
+ {
+     std::string why;
+@@ -89,8 +131,60 @@ void Dcsm27Port::on_availability(bool up, int64_t now_ms)
+         manager_->on_availability(up, now_ms);
+ }
+ 
++void Dcsm27Port::on_widget_wake(int64_t now_ms)
++{
++    if (!widget_restore_)
++        return;
++    for (auto &kv : contents_) {
++        Content &c = kv.second;
++        if (!remembered(c.spec) || c.phase == Phase::Stopping ||
++            !selections_.count(current_layout_) || selections_.at(current_layout_) != kv.first)
++            continue;
++        c.restore_at = now_ms + 300;
++        c.rearm_focus = true;
++        log_info("widget-restore: content %llu ignition wake, rearm in 300 ms", u(kv.first));
++    }
++}
++
+ void Dcsm27Port::dispatch(int64_t now_ms)
+ {
++    for (auto &kv : contents_) {
++        Content &c = kv.second;
++        if (c.cancel_focus_at && now_ms >= c.cancel_focus_at) {
++            std::string why;
++            const bool ok = wire_->focus(kv.first, false, &why);
++            log_info("widget-restore: content %llu focus off: %s", u(kv.first), ok ? "accepted" : why.c_str());
++            // Retry only an explicit cancellation; temporary invisibility retains the request.
++            c.focus_active = !ok;
++            c.cancel_focus_at = ok ? 0 : now_ms + 1000;
++        }
++        if (!c.restore_at || now_ms < c.restore_at)
++            continue;
++        c.restore_at = 0;
++        const bool rearm = c.rearm_focus;
++        c.rearm_focus = false;
++        if (c.phase != Phase::Offered || !up_)
++            continue;
++        if (remembered(c.spec) && selections_.count(current_layout_) &&
++            selections_.at(current_layout_) != kv.first)
++            continue;
++        std::string why;
++        if (rearm && c.focus_active) {
++            const bool ok = wire_->focus(kv.first, false, &why);
++            log_info("widget-restore: content %llu wake focus off: %s", u(kv.first), ok ? "accepted" : why.c_str());
++            if (!ok)
++                continue;
++            c.focus_active = false;
++        }
++        if (c.focus_active)
++            continue;
++        const bool ok = wire_->focus(kv.first, true, &why);
++        log_info("widget-restore: content %llu one focus request: %s", u(kv.first), ok ? "accepted" : why.c_str());
++        if (ok) {
++            c.focus_active = true;
++            c.cancel_focus_at = rearm ? 0 : now_ms + 2000;
++        }
++    }
+     std::vector<uint64_t> stopped;
+     stopped.swap(stopped_);
+     if (on_stopped)
+@@ -130,7 +224,7 @@ bool Dcsm27Port::holds(uint64_t scene_id) const
+     return false;
+ }
+ 
+-void Dcsm27Port::on_size(uint64_t content, const ContentArea &a, int64_t)
++void Dcsm27Port::on_size(uint64_t content, const ContentArea &a, int64_t now_ms)
+ {
+     auto it = contents_.find(content);
+     if (it == contents_.end())
+@@ -154,11 +248,34 @@ void Dcsm27Port::on_size(uint64_t content, const ContentArea &a, int64_t)
+         changed = true;
+     }
+     if (a.has_safe && (!was.has_safe || !same(a.safe, was.safe))) {
++        // The captured startup prompt reduces safe height, then restores it without changing layout.
++        if (widget_restore_ && remembered(c.spec) && c.phase == Phase::Offered && c.focus_active &&
++            was.has_safe && a.safe.w == was.safe.w && a.safe.h > was.safe.h &&
++            (!a.has_layout || (was.has_layout && a.layout == was.layout))) {
++            c.restore_at = c.cancel_focus_at = now_ms + 300;
++            log_info("widget-restore: content %llu safe height %u -> %u, rearm focus in 300 ms",
++                     u(content), was.safe.h, a.safe.h);
++        }
+         was.has_safe = true;
+         was.safe = a.safe;
+         changed = true;
+     }
+     if (a.has_layout && (!was.has_layout || a.layout != was.layout)) {
++        if (widget_restore_ && remembered(c.spec) && c.phase != Phase::Stopping) {
++            if (was.has_layout && !selections_.count(was.layout) &&
++                (c.phase == Phase::Shown || (c.hidden_at >= 0 && now_ms - c.hidden_at <= 1000))) {
++                selections_[was.layout] = content;
++                save_widget_selection();
++            }
++            current_layout_ = a.layout;
++            c.hidden_at = -1;
++            if (c.focus_active && was.has_layout)
++                c.cancel_focus_at = now_ms;
++            c.restore_at = selections_.count(a.layout) && selections_.at(a.layout) == content ? now_ms + 300 : 0;
++            c.rearm_focus = !was.has_layout && c.restore_at != 0;
++            log_info("widget-restore: content %llu layout %u -> %u, %s", u(content), was.layout, a.layout,
++                     c.restore_at ? "previously selected, wait 300 ms" : "another or no recorded selection");
++        }
+         was.has_layout = true;
+         was.layout = a.layout;
+         changed = true;
+@@ -189,19 +306,58 @@ void Dcsm27Port::on_show(uint64_t content, int64_t now_ms)
+         return;
+     log_info("dcsm: content %llu shown", u(content));
+     c->phase = Phase::Shown;
++    if (widget_restore_ && remembered(c->spec) && c->area.has_layout) {
++        current_layout_ = c->area.layout;
++        if (!selections_.count(current_layout_) || selections_.at(current_layout_) != content) {
++            selections_[current_layout_] = content;
++            save_widget_selection();
++        }
++        for (auto &kv : contents_) {
++            Content &other = kv.second;
++            if (kv.first == content || !remembered(other.spec))
++                continue;
++            other.restore_at = 0;
++            other.rearm_focus = false;
++            if (other.focus_active)
++                other.cancel_focus_at = now_ms;
++        }
++    }
++    if (c->restore_at || c->focus_active)
++        log_info("widget-restore: content %llu %s", u(content),
++                 c->focus_active ? "shown after focus request, holding through hide" : "shown before fallback");
++    c->restore_at = 0;
++    c->rearm_focus = false;
++    c->hidden_at = -1;
++    if (widget_restore_ && remembered(c->spec) && !c->focus_active) {
++        std::string why;
++        c->focus_active = wire_->focus(content, true, &why);
++        log_info("widget-restore: content %llu retain selected widget: %s", u(content),
++                 c->focus_active ? "accepted" : why.c_str());
++    }
++    if (c->focus_active)
++        c->cancel_focus_at = 0;
+     if (manager_)
+         manager_->on_shown(c->spec.scene_id, now_ms);
+ }
+ 
++void Dcsm27Port::park(Content &c, int64_t now_ms)
++{
++    if (c.phase == Phase::Shown) {
++        c.hidden_at = now_ms;
++        // Hide/release also covers factory startup overlays; retain the selected widget's request.
++    }
++    c.phase = Phase::Offered;
++    if (manager_)
++        manager_->on_parked(c.spec.scene_id, now_ms);
++}
++
+ void Dcsm27Port::on_hide(uint64_t content, int64_t now_ms)
+ {
+     Content *c = offered(content);
+     if (!c)
+         return;
+     log_info("dcsm: content %llu hidden", u(content));
+-    c->phase = Phase::Offered;
+-    if (manager_)
+-        manager_->on_parked(c->spec.scene_id, now_ms);
++    park(*c, now_ms);
+ }
+ 
+ void Dcsm27Port::on_release(uint64_t content, int64_t now_ms)
+@@ -210,9 +366,7 @@ void Dcsm27Port::on_release(uint64_t content, int64_t now_ms)
+     if (!c)
+         return;
+     log_info("dcsm: content %llu released by the cluster, still offered", u(content));
+-    c->phase = Phase::Offered;
+-    if (manager_)
+-        manager_->on_parked(c->spec.scene_id, now_ms);
++    park(*c, now_ms);
+ }
+ 
+ void Dcsm27Port::on_stop_accepted(uint64_t content, int64_t now_ms)
+diff --git a/native/cluster-render/src/dcsm27_port.h b/native/cluster-render/src/dcsm27_port.h
+index 3dfbab5..942ca72 100644
+--- a/native/cluster-render/src/dcsm27_port.h
++++ b/native/cluster-render/src/dcsm27_port.h
+@@ -56,6 +56,7 @@ public:
+     virtual bool offer(const TargetSpec &t, std::string *why) = 0;
+     virtual bool stop_offer(uint64_t content, std::string *why) = 0;
+     virtual bool ready(uint64_t content, std::string *why) = 0;
++    virtual bool focus(uint64_t content, bool enabled, std::string *why) = 0;
+ };
+ 
+ /* The cluster's area for a content (contentSizeChange): its canvas, the
+@@ -72,6 +73,7 @@ class Dcsm27Port : public Port {
+ public:
+     explicit Dcsm27Port(Dcsm27Wire *wire) : wire_(wire) {}
+     void set_manager(SlotManager *m) { manager_ = m; }
++    void set_widget_restore(bool enabled) { widget_restore_ = enabled; }
+ 
+     bool available() const override { return up_; }
+     void request(const TargetSpec &t) override;
+@@ -92,6 +94,8 @@ public:
+     /* Delivers the answers to this pass's requests (after the slot
+      * manager's tick, before the next one). */
+     void dispatch(int64_t now_ms);
++    void on_widget_wake(int64_t now_ms);
++    void load_widget_selection(const std::string &path);
+     /* An offer is stopping: the cluster has not accepted the stop yet. */
+     bool stopping() const;
+     /* A content of the scene is offered or its offer is stopping. */
+@@ -108,6 +112,8 @@ private:
+         TargetSpec spec;
+         Phase phase = Phase::Offered;
+         ContentArea area;   /* as last logged */
++        int64_t hidden_at = -1, restore_at = 0, cancel_focus_at = 0;
++        bool focus_active = false, rearm_focus = false;
+     };
+     struct Answer {
+         uint64_t scene = 0;
+@@ -119,10 +125,16 @@ private:
+     bool offer(Content &c);
+     /* The content's target while its offer stands; null otherwise. */
+     Content *offered(uint64_t content);
++    void park(Content &c, int64_t now_ms);
+ 
+     Dcsm27Wire *wire_;
+     SlotManager *manager_ = nullptr;
+     bool up_ = false;
++    bool widget_restore_ = false;
++    std::map<uint32_t, uint64_t> selections_;
++    std::string selection_path_;
++    uint32_t current_layout_ = 0;
++    void save_widget_selection() const;
+     std::map<uint64_t, Content> contents_;   /* by content id */
+     std::vector<Answer> answers_;
+     std::vector<uint64_t> stopped_;          /* scene ids, for on_stopped */
+diff --git a/native/cluster-render/src/main.cpp b/native/cluster-render/src/main.cpp
+index eda7cc2..49b233c 100644
+--- a/native/cluster-render/src/main.cpp
++++ b/native/cluster-render/src/main.cpp
+@@ -102,12 +102,14 @@ void define_keys(cld::Config *cfg)
+     cfg->define("id8_widget_scene_id", "0x4d4755000001");
+     cfg->define("id8_widget_size", "2240x896");
+     cfg->define("id8_widget_linger_ms", "3000");
+-    cfg->define("id8_widget_description", "Cluster renderer");
++    cfg->define("id8_widget_description", "87 Arcade");
++    cfg->define("id8_widget_selection_path", "/var/opt/cluster-render/state/widget-selection.txt");
+     cfg->define("id8_widget_order", "50");
+     cfg->define("id8_widget_preview", "");
+     cfg->define("id8_widget_background_id", "");
+     cfg->define("id8_widget_layouts", "");
+     cfg->define("id8_widget_focus", "0");
++    cfg->define("id8_widget_restore_on_layout", "0");
+     cfg->define("id8_popup_category", "43100301");
+     cfg->define("id8_popup_content", "43204003");
+     cfg->define("id8_popup_scene_id", "0x4d4755000002");
+@@ -156,6 +158,7 @@ bool load_targets(const cld::Config &cfg, int generation, std::vector<TargetSpec
+         const std::string p = g + name + "_";
+         TargetSpec t;
+         t.name = name;
++        t.remember = generation == 8 && (name == "widget" || cfg.num((p + "remember").c_str()) != 0);
+         if (!cfg.has((p + slot).c_str()) || !cfg.has((p + "scene_id").c_str()) ||
+             (generation == 8 && !cfg.has((p + "content").c_str()))) {
+             *err = "target " + name + ": " + p + slot + (generation == 8 ? ", " + p + "content" : std::string()) +
+diff --git a/native/cluster-render/src/server.cpp b/native/cluster-render/src/server.cpp
+index 831946b..db320bf 100644
+--- a/native/cluster-render/src/server.cpp
++++ b/native/cluster-render/src/server.cpp
+@@ -590,6 +590,10 @@ void Server::on_json(Client &c, const std::string &body, int64_t now_ms)
+         op_layer(c, j, now_ms);
+         return;
+     }
++    if (op == "widget-wake" && on_widget_wake) {
++        on_widget_wake(now_ms);
++        return;
++    }
+     if (op == "status") {
+         send(c, cr::json_object({{"ev", cr::json_quote("status")}, {"text", cr::json_quote(status_text(now_ms))}}));
+         return;
+diff --git a/native/cluster-render/src/server.h b/native/cluster-render/src/server.h
+index c10fda9..59c8aea 100644
+--- a/native/cluster-render/src/server.h
++++ b/native/cluster-render/src/server.h
+@@ -14,6 +14,7 @@
+ 
+ #include <poll.h>
+ 
++#include <functional>
+ #include <map>
+ #include <string>
+ #include <vector>
+@@ -42,6 +43,8 @@ public:
+     /* Sends what changed since the last call. */
+     void report(int64_t now_ms);
+ 
++    std::function<void(int64_t)> on_widget_wake;
++
+     size_t clients() const { return clients_.size(); }
+     std::string status_text(int64_t now_ms) const;
+ 
+diff --git a/native/cluster-render/src/slots.h b/native/cluster-render/src/slots.h
+index 26ed36d..fa2f281 100644
+--- a/native/cluster-render/src/slots.h
++++ b/native/cluster-render/src/slots.h
+@@ -128,6 +128,7 @@ namespace crs {
+  * iDrive 8 the slot is a DCSM category and the scene goes as the content
+  * offered in it (dcsm27_port.h). */
+ struct TargetSpec {
++    bool remember = false;
+     std::string name;
+     uint64_t slot = 0;
+     uint32_t content_class = 0;
+diff --git a/native/cluster-render/src/unit_idrive8.cpp b/native/cluster-render/src/unit_idrive8.cpp
+index b29e12e..eaccf38 100644
+--- a/native/cluster-render/src/unit_idrive8.cpp
++++ b/native/cluster-render/src/unit_idrive8.cpp
+@@ -117,6 +117,16 @@ public:
+         return s == ramses::StatusOK;
+     }
+ 
++    bool focus(uint64_t content, bool enabled, std::string *why) override
++    {
++        // Separate from the persistent focus request (id 0) used by popup targets.
++        const ramses::status_t s = enabled ? p_.enableFocusRequest(content_id(content), 87)
++                                           : p_.disableFocusRequest(content_id(content), 87);
++        if (s != ramses::StatusOK)
++            *why = p_.getStatusMessage(s);
++        return s == ramses::StatusOK;
++    }
++
+ private:
+     void menu_entry(const TargetSpec &t, const std::string &k, const std::string &desc, ramses::DcsmMetadataCreator *md)
+     {
+@@ -259,8 +269,14 @@ int start(const cld::Config &cfg, char **)
+ 
+     ProviderWire wire(*provider, cfg);
+     Dcsm27Port port(&wire);
++    port.set_widget_restore(cfg.num("id8_widget_restore_on_layout") != 0);
++    log_info("widget-restore: widget-manager-v3 %s (300 ms, shared selection and ignition recovery)",
++             cfg.num("id8_widget_restore_on_layout") != 0 ? "enabled" : "disabled");
++    if (cfg.num("id8_widget_restore_on_layout") != 0)
++        port.load_widget_selection(cfg.str("id8_widget_selection_path"));
+     Service service(&gpu, &port, sc);
+     port.set_manager(&service.slots());
++    service.server().on_widget_wake = [&port](int64_t now_ms) { port.on_widget_wake(now_ms); };
+     port.on_stopped = [&gpu](uint64_t scene) { gpu.drop_retired(scene); };
+     gpu.offered = [&port](uint64_t scene) { return port.holds(scene); };
+     Events events(port);
+diff --git a/native/cluster-render/test/dcsm27_port_test.cpp b/native/cluster-render/test/dcsm27_port_test.cpp
+index ced4b35..04d0399 100644
+--- a/native/cluster-render/test/dcsm27_port_test.cpp
++++ b/native/cluster-render/test/dcsm27_port_test.cpp
+@@ -10,6 +10,7 @@
+  * for content not offered, or stopping, are ignored; two targets go their
+  * own ways; the framework going away forgets everything. */
+ #include <cstdio>
++#include <unistd.h>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -41,6 +42,13 @@ static bool calls_are(const std::string &want)
+ 
+ struct Wire : Dcsm27Wire {
+     bool refuse = false;
++    bool refuse_focus = false;
++    bool focus(uint64_t c, bool enabled, std::string *why) override
++    {
++        calls.push_back(std::string(enabled ? "focus " : "unfocus ") + std::to_string(c));
++        if (refuse_focus) *why = "focus refused";
++        return !refuse_focus;
++    }
+     bool offer(const TargetSpec &t, std::string *why) override
+     {
+         calls.push_back("offer " + std::to_string(t.content) + " in " + std::to_string(t.slot));
+@@ -304,13 +312,303 @@ static void gone()
+     ok("later events are ignored", r.m.status(0).state == TargetState::Unavailable && calls_are(""));
+ }
+ 
+-int main()
++static void widget_restore()
+ {
++    const auto layout = [](Rig &r, unsigned n) {
++        ContentArea a; a.has_layout = true; a.layout = n;
++        r.port.on_size(kWidget, a, r.now);
++    };
++    const auto start = [&](Rig &r) {
++        r.offered(1);
++        layout(r, 4);
++        r.port.on_show(kWidget, r.now);
++        r.port.set_widget_restore(true);
++        r.port.on_release(kWidget, r.now);
++        layout(r, 5);
++        r.port.set_widget_restore(false);
++        r.port.on_show(kWidget, r.now);
++        r.port.set_widget_restore(true);
++        calls.clear();
++    };
++    {
++        Rig r; r.offered(1); layout(r, 4);
++        r.port.set_widget_restore(true);
++        r.port.on_show(kWidget, r.now); calls.clear();
++        r.port.on_release(kWidget, r.now);
++        r.now += 23000;
++        r.port.on_widget_wake(r.now);
++        r.now += 299; r.port.dispatch(r.now);
++        ok("ignition recovery waits 300 ms without requiring size events", calls_are(""));
++        r.now++; r.port.dispatch(r.now);
++        ok("ignition recovery rearms an already retained request", calls_are("unfocus 43204001; focus 43204001"));
++        r.now += 8000; r.port.dispatch(r.now);
++        ok("factory startup overlay can outlast the normal two-second window", calls_are(""));
++        r.port.on_show(kWidget, r.now);
++        r.now += 30000; r.port.dispatch(r.now);
++        ok("wake recovery remains one request after show", calls_are(""));
++        r.port.on_widget_wake(r.now);
++        r.now += 300; r.port.dispatch(r.now);
++        ok("a wake with widget still shown leaves it alone", calls_are(""));
++    }
++    {
++        Rig r; r.offered(1); layout(r, 4); r.port.set_widget_restore(true);
++        r.port.on_widget_wake(r.now);
++        r.now += 300; r.port.dispatch(r.now);
++        ok("ignition does not summon a never-selected widget", calls_are(""));
++    }
++
++    {
++        Rig r; r.offered(1);
++        ContentArea area;
++        area.has_layout = area.has_safe = true;
++        area.layout = 4; area.safe.w = 630; area.safe.h = 570;
++        r.port.on_size(kWidget, area, r.now);
++        r.port.set_widget_restore(true);
++        r.port.on_show(kWidget, r.now); calls.clear();
++        r.port.on_release(kWidget, r.now);
++        r.now += 22000; area.safe.h = 426;
++        r.port.on_size(kWidget, area, r.now); r.port.dispatch(r.now);
++        ok("startup area shrinking leaves the factory prompt alone", calls_are(""));
++        r.now += 4122; area.safe.h = 570;
++        r.port.on_size(kWidget, area, r.now);
++        r.now += 299; r.port.dispatch(r.now);
++        ok("expanded area waits 300 ms before recovery", calls_are(""));
++        r.now++; r.port.dispatch(r.now);
++        ok("startup area restoration rearms retained focus once", calls_are("unfocus 43204001; focus 43204001"));
++        r.port.on_show(kWidget, r.now);
++        r.port.on_size(kWidget, area, r.now);
++        r.now += 60000; r.port.dispatch(r.now);
++        ok("repeated size and successful show do not repeat recovery", calls_are(""));
++    }
++
++    {
++        Rig r; r.offered(1); layout(r, 4);
++        r.port.set_widget_restore(true);
++        r.port.on_show(kWidget, r.now);
++        ok("manually selected widget establishes one retained request", calls_are("focus 43204001"));
++        r.port.on_hide(kWidget, r.now); r.port.dispatch(r.now);
++        r.now += 8039;
++        r.port.on_release(kWidget, r.now); r.port.dispatch(r.now);
++        ok("captured startup hide then release keeps request without polling", calls_are(""));
++        r.now += 30000; r.port.on_show(kWidget, r.now); r.port.dispatch(r.now);
++        ok("returning after startup reuses retained request", calls_are(""));
++        r.m.want(1, false, false); r.tick();
++        r.now += 4000; r.tick();
++        ok("stopping the app still stops its offer", calls_are("stop 43204001"));
++    }
++
++    {
++        Rig r; start(r);
++        // Captured order: release -> layout -> new app layer, with no ready/show.
++        r.port.on_release(kWidget, r.now);
++        layout(r, 4);
++        r.port.dispatch(r.now);
++        calls.clear();
++        r.now += 299; r.port.dispatch(r.now);
++        ok("restore waits for OEM recovery", calls_are(""));
++        r.now++; r.port.dispatch(r.now);
++        ok("release + changed layout requests focus once", calls_are("focus 43204001"));
++        layout(r, 4);
++        r.now += 2000; r.port.dispatch(r.now);
++        ok("focus expires even without show", calls_are("unfocus 43204001"));
++        r.now += 60000; r.port.dispatch(r.now);
++        ok("no repeat request or scene reoffer", calls_are(""));
++    }
++    {
++        Rig r; start(r);
++        layout(r, 4); r.port.on_release(kWidget, r.now);
++        r.port.dispatch(r.now); calls.clear();
++        r.now += 300; r.port.dispatch(r.now);
++        ok("layout before release also supported", calls_are("focus 43204001"));
++        r.port.on_show(kWidget, r.now); r.port.dispatch(r.now);
++        ok("show keeps the accepted focus", calls_are(""));
++        r.now += 60000; r.port.dispatch(r.now);
++        ok("visible widget keeps focus without polling", calls_are(""));
++        r.port.on_hide(kWidget, r.now); r.port.dispatch(r.now);
++        ok("hidden widget keeps its existing request", calls_are(""));
++        r.port.on_release(kWidget, r.now); r.port.dispatch(r.now);
++        ok("startup release does not cancel or repeat focus", calls_are(""));
++        r.now += 3000; layout(r, 5);
++        calls.clear();
++        r.now += 300; r.port.dispatch(r.now);
++        ok("other layout remembers its own widget", calls_are("unfocus 43204001; focus 43204001"));
++        r.port.on_show(kWidget, r.now);
++        layout(r, 4); r.port.dispatch(r.now);
++        ok("layout change relinquishes held focus", calls_are("unfocus 43204001"));
++        r.port.on_release(kWidget, r.now);
++        r.now += 12000; r.port.dispatch(r.now);
++        ok("temporarily hidden layout retains its selected widget", calls_are("focus 43204001"));
++    }
++    {
++        Rig r; start(r);
++        r.port.on_release(kWidget, r.now); layout(r, 4);
++        r.now += 250; r.port.on_show(kWidget, r.now);
++        r.now += 5000; r.port.dispatch(r.now);
++        ok("OEM recovery retains the selected widget once", calls_are("focus 43204001"));
++    }
++    {
++        Rig r; start(r);
++        r.port.on_hide(kWidget, r.now);
++        r.now += 9000; r.port.dispatch(r.now);
++        ok("manual hide alone cannot request focus", calls_are(""));
++        layout(r, 6); r.now += 9000; r.port.dispatch(r.now);
++        ok("unselected destination keeps its original selection", calls_are(""));
++    }
++    {
++        Rig r; start(r);
++        r.port.set_widget_restore(false);
++        r.port.on_release(kWidget, r.now); layout(r, 4);
++        r.now += 9000; r.port.dispatch(r.now);
++        ok("feature off preserves existing behavior", calls_are(""));
++    }
++    {
++        Rig r; r.port.set_widget_restore(true); r.offered(1);
++        layout(r, 5); layout(r, 4);
++        r.now += 9000; r.port.dispatch(r.now);
++        ok("never selected widget not summoned", calls_are(""));
++    }
++    {
++        Rig r; start(r);
++        r.port.on_release(kWidget, r.now); layout(r, 4);
++        r.wire.refuse_focus = true;
++        r.now += 300; r.port.dispatch(r.now);
++        ok("focus refusal recorded once", calls_are("focus 43204001"));
++        r.now += 60000; r.port.dispatch(r.now);
++        ok("refusal never causes retries", calls_are(""));
++    }
++    {
++        Rig r; start(r);
++        r.port.on_release(kWidget, r.now); layout(r, 4);
++        r.m.want(1, false, false); r.tick();
++        calls.clear();
++        r.now += 9000; r.port.dispatch(r.now);
++        ok("stopping content cannot request focus", calls_are(""));
++    }
++    {
++        Rig r; start(r);
++        r.port.on_release(kWidget, r.now); layout(r, 4);
++        r.port.on_availability(false, r.now);
++        r.now += 9000; r.port.dispatch(r.now);
++        ok("disconnect clears pending recovery", calls_are(""));
++    }
++    {
++        Rig r; start(r);
++        r.port.on_hide(kWidget, r.now); r.port.on_release(kWidget, r.now);
++        layout(r, 4); r.now += 300; r.port.dispatch(r.now);
++        ok("hide then release retains recent selected state", calls_are("focus 43204001"));
++        r.wire.refuse_focus = true;
++        r.now += 2000; r.port.dispatch(r.now);
++        ok("failed cancellation is visible", calls_are("unfocus 43204001"));
++        r.now += 20; r.port.dispatch(r.now);
++        ok("cancellation retries are rate limited", calls_are(""));
++        r.wire.refuse_focus = false;
++        r.now += 1000; r.port.dispatch(r.now);
++        ok("cancellation retried, without another focus", calls_are("unfocus 43204001"));
++    }
++    {
++        Rig r; r.port.set_widget_restore(true); r.offered();
++        ContentArea a; a.has_layout = true; a.layout = 5;
++        r.port.on_size(kCentre, a, r.now); r.port.on_show(kCentre, r.now);
++        r.port.on_release(kCentre, r.now); a.layout = 4;
++        r.port.on_size(kCentre, a, r.now);
++        r.now += 9000; r.port.dispatch(r.now);
++        ok("map target is untouched", calls_are(""));
++    }
++}
++
++static void shared_widget_selection()
++{
++    TargetSpec second;
++    second.name = "track"; second.remember = true;
++    second.slot = 43100301; second.content = 43204002; second.scene_id = 0x4d4755000003;
++    second.width = 2240; second.height = 896;
++    {
++        Rig r; r.port.set_widget_restore(true); r.m.add(second);
++        r.offered(1); r.offered(2);
++        ContentArea area; area.has_layout = true; area.layout = 4;
++        r.port.on_size(kWidget, area, r.now);
++        r.port.on_size(second.content, area, r.now);
++        r.port.on_show(kWidget, r.now); calls.clear();
++        r.port.on_release(kWidget, r.now);
++        r.port.on_show(second.content, r.now);
++        r.port.dispatch(r.now);
++        ok("selecting the second widget cancels the first retained request",
++           calls_are("focus 43204002; unfocus 43204001"));
++        r.port.on_release(second.content, r.now);
++        r.port.on_widget_wake(r.now);
++        r.now += 300; r.port.dispatch(r.now);
++        ok("a wake restores only the last selected widget in that layout",
++           calls_are("unfocus 43204002; focus 43204002"));
++        r.port.on_show(second.content, r.now);
++        r.port.on_release(second.content, r.now);
++        area.layout = 5;
++        r.port.on_size(kWidget, area, r.now);
++        r.port.on_size(second.content, area, r.now);
++        r.port.dispatch(r.now); calls.clear();
++        r.port.on_show(kWidget, r.now); calls.clear();
++        r.port.on_release(kWidget, r.now);
++        area.layout = 4;
++        r.port.on_size(kWidget, area, r.now);
++        r.port.on_size(second.content, area, r.now);
++        r.port.dispatch(r.now); calls.clear();
++        r.now += 300; r.port.dispatch(r.now);
++        ok("normal and M layouts keep independent component choices", calls_are("focus 43204002"));
++    }
++    char path[] = "/tmp/crs-widget-memory-XXXXXX";
++    const int fd = mkstemp(path);
++    close(fd);
++    {
++        Rig r; r.port.load_widget_selection(path); r.port.set_widget_restore(true); r.offered(1);
++        ContentArea area; area.has_layout = true; area.layout = 4;
++        r.port.on_size(kWidget, area, r.now);
++        r.port.on_show(kWidget, r.now);
++        calls.clear();
++    }
++    {
++        Rig r; r.port.load_widget_selection(path); r.port.set_widget_restore(true); r.offered(1);
++        ContentArea area; area.has_layout = true; area.layout = 4;
++        r.port.on_size(kWidget, area, r.now);
++        r.now += 300; r.port.dispatch(r.now);
++        ok("a fresh service restores persisted selection after first layout report",
++           calls_are("focus 43204001"));
++        r.now += 8000; r.port.dispatch(r.now);
++        ok("persisted startup selection waits through the factory prompt", calls_are(""));
++        r.port.on_availability(false, r.now);
++        r.port.on_availability(true, r.now);
++        r.now += 1500;
++        r.offered(1); r.port.on_size(kWidget, area, r.now);
++        r.now += 300; r.port.dispatch(r.now);
++        ok("provider reconnect retains the selected component", calls_are("focus 43204001"));
++    }
++    unlink(path);
++}
++
++int main(int argc, char **argv)
++{
++    if (argc == 3) {
++        Rig r;
++        r.port.load_widget_selection(argv[2]);
++        r.port.set_widget_restore(true);
++        r.offered(1);
++        ContentArea area; area.has_layout = true; area.layout = 4;
++        r.port.on_size(kWidget, area, r.now);
++        if (std::string(argv[1]) == "--save-selection") {
++            r.port.on_show(kWidget, r.now);
++            return 0;
++        }
++        r.now += 300;
++        r.port.dispatch(r.now);
++        ok("independent process restores selection from disk", calls_are("focus 43204001"));
++        return failures ? 1 : 0;
++    }
++
+     basics();
+     restop();
+     refused();
+     two_targets();
+     gone();
++    widget_restore();
++    shared_widget_selection();
+     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);
+     return failures ? 1 : 0;
+ }
+diff --git a/native/cluster-render/test/service_test.cpp b/native/cluster-render/test/service_test.cpp
+index e7c1e47..f9b2c66 100644
+--- a/native/cluster-render/test/service_test.cpp
++++ b/native/cluster-render/test/service_test.cpp
+@@ -1267,6 +1267,22 @@ int main()
+     std::string text = r.svc->server().status_text(r.now);
+     ok("the status names the targets and the layers",
+        text.find("target map") != std::string::npos && text.find("image of overlay") != std::string::npos);
++    {
++        Rig wake;
++        int requests = 0;
++        int64_t received_at = 0;
++        wake.svc->server().on_widget_wake = [&](int64_t now_ms) {
++            requests++;
++            received_at = now_ms;
++        };
++        Raw vehicle(wake.path);
++        vehicle.send("{\"op\":\"hello\",\"app\":\"87-arcade\",\"proto\":1}");
++        wake.pump(10);
++        vehicle.send("{\"op\":\"widget-wake\"}");
++        wake.pump(10);
++        ok("vehicle wake reaches the server callback once through the real socket",
++           requests == 1 && received_at > 0);
++    }
+     take_over_and_fall_back();
+     guide_hold();
+     guide_hold_choice();
