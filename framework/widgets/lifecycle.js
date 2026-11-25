@@ -1,6 +1,6 @@
 'use strict';
 // One observer for all widgets, using the power sequence verified on the vehicle.
-async function observe(signals, client, log) {
+async function observe(signals, client, log, onState) {
     let wakePending = true, recoveryPending = false;
     const deliver = () => {
         if (recoveryPending && client.ready) {
@@ -11,6 +11,7 @@ async function observe(signals, client, log) {
     client.on('ready', deliver);
     return signals.watch('de.bmw.infotainment.lifecycle.lifecycle.Lifecycle', 'Front', {
         powerStateDetailed: state => {
+            if (onState) onState(state);
             if (['WELCOME_SCREEN', 'GOODBYE_SCREEN', 'SHUTDOWN_MODE_USER_OFF', 'SLEEP_MODE_ALL_OFF'].indexOf(state) >= 0) {
                 wakePending = true;
                 recoveryPending = false;

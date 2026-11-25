@@ -2,14 +2,23 @@
 const fs = require('fs'), os = require('os'), path = require('path'), assert = require('assert');
 const { register } = require('./registry');
 const { observe } = require('./lifecycle');
+function removeFixture(dir) {
+    for (const name of fs.readdirSync(dir)) {
+        const file = path.join(dir, name);
+        if (fs.lstatSync(file).isDirectory()) removeFixture(file);
+        else fs.unlinkSync(file);
+    }
+    fs.rmdirSync(dir);
+}
 (async () => {
     let receive, calls = 0, watched;
+    const powerStates = [];
     const client = new (require('events').EventEmitter)();
     client.ready = true; client.wakeWidget = () => calls++;
     await observe({ watch: async (iface, instance, fields) => {
         watched = [iface, instance]; receive = fields.powerStateDetailed;
         return { shutdown: async () => {} };
-    } }, client, { info() {} });
+    } }, client, { info() {} }, state => powerStates.push(state));
     assert(watched[0].endsWith('.Lifecycle') && watched[1] === 'Front');
     receive('FULL_ON_USER_ON'); assert.equal(calls, 1, 'cold startup already in ignition state requests recovery');
     receive('WELCOME_SCREEN'); receive('FULL_ON_USER_ON'); assert.equal(calls, 2);
@@ -24,6 +33,8 @@ const { observe } = require('./lifecycle');
     client.ready = false;
     receive('WELCOME_SCREEN'); receive('FULL_ON_USER_ON'); receive('GOODBYE_SCREEN');
     client.ready = true; client.emit('ready'); assert.equal(calls, 4, 'shutdown cancels an undelivered old wake');
+    assert.equal(powerStates[0], 'FULL_ON_USER_ON');
+    assert.equal(powerStates[powerStates.length - 1], 'GOODBYE_SCREEN', 'shared power state reaches widget consumers');
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'id8-widget-registry-'));
     try {
         const apps = path.join(tmp, 'apps'); fs.mkdirSync(apps);
@@ -58,5 +69,5 @@ const { observe } = require('./lifecycle');
         assert.deepEqual(JSON.parse(fs.readFileSync(state, 'utf8')).widgets['track-view'], original.widgets['track-view']);
         assert(fs.readFileSync(config, 'utf8').includes('id8_widget1_remember = 1'));
         console.log('PASS: one power observer, one event per wake, two widgets, stable identities, idempotent registration, reinstall');
-    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+    } finally { removeFixture(tmp); }
 })().catch(e => { console.error(e); process.exitCode = 1; });

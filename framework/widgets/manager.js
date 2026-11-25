@@ -29,7 +29,8 @@ function stop() {
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
 process.on('exit', () => children.forEach(c => c.kill('SIGTERM')));
-observe(require(path.join(kit, 'signals')), client, log).then(sub => {
+observe(require(path.join(kit, 'signals')), client, log,
+    state => children.forEach(child => child.send({ type: 'power-state', state }))).then(sub => {
     subscription = sub;
     if (sub.error) throw Error(sub.error);
     log.info('widget-manager: shared power subscription ready');

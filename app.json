@@ -4,7 +4,7 @@
   "version": "0.1.0-preview",
   "target": "widget",
   "entry": "render.js",
-  "description": "ROAD: tyre pressures and temperatures. M SPORT: G-force. Both: club logo, oil and coolant temperatures.",
+  "description": "One widget: four tyre pressures and temperatures, seven powertrain readings with bars. SPORT also shows live G, fading trail and trip envelope.",
   "preview": "assets/preview.png",
   "vehicle": "widget.js"
 }
