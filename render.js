@@ -97,15 +97,19 @@ const metrics = [
     ['fuelRail', 'HPFP', 'bar', 0, 0, 350],
     ['boost', 'BOOST', 'bar', 2, -0.5, 3]
 ];
+const temperatureMetrics = metrics.slice(0, 4);
+const pressureMetrics = metrics.slice(4);
 
 const layouts = {
     road: {
-        panels: [[48, 152, 472, 492], [538, 152, 534, 492]],
-        wheelX: [166, 402], wheelY: [260, 422], wheelGuide: [73, 495, 208, 495, 20], guideY: 342,
-        pressureSize: 66, pressureUnit: 22, pressureGap: 7, tyreSize: 36, tyreOffset: 44,
-        power: { left: 562, right: 1048, top: 172, row: 64, gap: 18, size: 48, unitSize: 20, labelSize: 20,
-            showBars: true, barWidth: 180, barHeight: 6 },
-        mark: [224, 514, 284], statusY: 632
+        panels: [[48, 152, 314, 492], [376, 152, 368, 492], [758, 152, 314, 492]],
+        wheelX: [468, 652], wheelY: [248, 408], wheelGuide: [400, 720, 196, 464, 18], guideY: 328,
+        pressureSize: 56, pressureUnit: 20, pressureGap: 6, tyreSize: 30, tyreUnit: 20, tyreOffset: 42,
+        temperature: { left: 68, right: 342, top: 172, row: 116, size: 56, unitSize: 20, labelSize: 20,
+            showBars: true, barHeight: 7, labelOffset: 48, valueOffset: 58, barOffset: 76, unitGap: 8 },
+        power: { left: 778, right: 1052, top: 186, row: 152, size: 56, unitSize: 20, labelSize: 20,
+            showBars: true, barHeight: 7, labelOffset: 54, valueOffset: 64, barOffset: 88, unitGap: 8 },
+        mark: [220, 514, 560], statusY: 632
     },
     sport: {
         panels: [[22, 154, 200, 394], [230, 154, 312, 394], [550, 154, 200, 394]],
@@ -116,22 +120,24 @@ const layouts = {
     }
 };
 
-function powertrain(cv, data, { left, right, top, row, gap, size, unitSize, labelSize, showBars, barWidth, barHeight }) {
-    const numberRight = right - textWidth('bar', unitSize) - (showBars ? 10 : 6);
-    metrics.forEach(([key, label, unit, decimals, min, max], index) => {
+function powertrain(cv, data, { left, right, top, row, gap = 0, size, unitSize, labelSize, showBars, barHeight,
+    labelOffset = 25, valueOffset = row * 0.64, barOffset, unitGap = 6 }, readings = metrics) {
+    const numberRight = right - textWidth('bar', unitSize) - unitGap;
+    const barWidth = right - left;
+    readings.forEach(([key, label, unit, decimals, min, max], index) => {
         const y = top + index * row + (index < 4 ? 0 : gap);
         const v = data.valid ? data[key] : null, live = Number.isFinite(v);
         const style = key === 'oil' || key === 'coolant' ? temperatureStyle(key, v) : null;
         const alert = style && style.label;
         const color = live ? (alert ? style.color : C.text) : C.missing;
         const labelColor = live ? C.dim : C.missing;
-        const baseline = y + row * 0.64;
-        const labelBaseline = y + (showBars ? 17 : 25);
+        const baseline = y + valueOffset;
+        const labelBaseline = y + labelOffset;
         text(cv, label, left, labelBaseline, labelSize, labelColor);
         text(cv, fmt(v, decimals), numberRight, baseline, size, color, { font: 'num', align: 'right' });
         text(cv, unit, right, showBars ? baseline : labelBaseline, unitSize, labelColor, { align: 'right' });
         if (!showBars) return;
-        const barY = y + 28;
+        const barY = y + barOffset;
         cv.roundRect(left, barY, barWidth, barHeight, barHeight / 2, C.track);
         if (live) {
             const fraction = clamp((v - min) / (max - min), 0, 1);
@@ -200,10 +206,10 @@ function staticLayer(Canvas, w, h, layout, sport) {
     layer.line(x + gap / 2, y, right, y, 1, C.guide);
     layer.line(x, top, x, y - gap / 2, 1, C.guide);
     layer.line(x, y + gap / 2, x, bottom, 1, C.guide);
-    const power = layout.power;
-    const separatorY = power.top + 4 * power.row + power.gap / 2 - 5;
-    layer.line(power.left, separatorY, power.right, separatorY, 1, C.guide);
     if (sport) {
+        const power = layout.power;
+        const separatorY = power.top + 4 * power.row + power.gap / 2 - 5;
+        layer.line(power.left, separatorY, power.right, separatorY, 1, C.guide);
         layer.line(gx - r, gy, gx + r, gy, 1, '#2a4154');
         layer.line(gx, gy - r, gx, gy + r, 1, '#2a4154');
         layer.arc(gx, gy, r / 2 - 0.6, r / 2 + 0.6, 0, 360, '#334d63');
@@ -226,15 +232,18 @@ function render(cv, data) {
         const pressure = value('pressure' + key), tyre = value('tyre' + key);
         wheelReading(cv, fmt(pressure, 1), 'bar', x, y, layout.pressureSize, layout.pressureUnit,
             layout.pressureGap, Number.isFinite(pressure) ? C.text : C.missing);
-        wheelReading(cv, fmt(tyre, 0), '°C', x, y + layout.tyreOffset, layout.tyreSize, layout.tyreSize, 3,
+        wheelReading(cv, fmt(tyre, 0), '°C', x, y + layout.tyreOffset, layout.tyreSize, sport ? layout.tyreSize : layout.tyreUnit, 3,
             Number.isFinite(tyre) ? C.dim : C.missing);
     });
     if (sport) {
         // Report cached text to observers on each frame, without redrawing its glyphs.
         if (typeof cv._onText === 'function') cv._onText(...scaleText);
         gMeter(cv, data);
+        powertrain(cv, data, layout.power);
+    } else {
+        powertrain(cv, data, layout.temperature, temperatureMetrics);
+        powertrain(cv, data, layout.power, pressureMetrics);
     }
-    powertrain(cv, data, layout.power);
     if (!data.valid) text(cv, data.stale ? 'DATA STALE' : 'NO DATA', layout.power.right, layout.statusY,
         16, C.hot, { align: 'right', spacing: 1 });
 }

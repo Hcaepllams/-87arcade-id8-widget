@@ -13,8 +13,9 @@ const PHASES = [
 const CADENCE = [0, 3000, 0, 5000, 1500, 1500, 0];
 const DEFAULT_DIDS = [0x580F, 0x586F, 0x4201, 0x5658];
 const LIVE_DIDS = DEFAULT_DIDS.concat(0x4650);
-const LIVE_CADENCE = 1500, LIVE_TTL = 15000, LIVE_SUMMARY_INTERVAL = 60000;
-const LIVE_EVENTS = new Set(['gate', 'status_change', 'malformed', 'tasError', 'live_summary']);
+const LIVE_CADENCE = 3000, LIVE_TTL = 25000, LIVE_SUMMARY_INTERVAL = 60000;
+const LIVE_REJECT_GAPS = [1370, 1890, 2410, 1630];
+const LIVE_EVENTS = new Set(['gate', 'status_change', 'malformed', 'tasError', 'live_sample', 'live_summary']);
 const ALTERNATE_DIDS = { 0x586F: 0x4436, 0x5658: 0x58EF };
 const UNSUPPORTED_NRC = new Set(['0x11', '0x12', '0x31']);
 const DID_SPECS = [
@@ -86,6 +87,10 @@ function newStats() {
     return { sent: 0, ok: 0, tasReject: 0, tasError: 0, nrc: 0, timeout: 0, malformed: 0, totalMs: 0 };
 }
 
+function newLiveStats() {
+    return Object.assign(newStats(), { maxConsecRej: 0, maxOkGapMs: null });
+}
+
 class DiagProbe {
     constructor(data, signals, log, opts) {
         opts = opts || {};
@@ -118,7 +123,10 @@ class DiagProbe {
         if (this.mode === 'probe') this.resetRound();
         else {
             this.nextRequest = 0;
-            this.liveStats = newStats();
+            this.liveStats = newLiveStats();
+            this.liveConsecRej = 0;
+            this.liveDoneAt = null;
+            this.liveLastOkAt = null;
         }
     }
 
@@ -258,14 +266,14 @@ class DiagProbe {
     tickLive(now) {
         if (!this.initialized) return;
         if (now >= this.liveSummaryAt) {
-            const { sent, ok, tasReject, tasError, nrc, timeout, malformed, totalMs } = this.liveStats;
+            const { sent, ok, tasReject, tasError, nrc, timeout, malformed, totalMs, maxConsecRej, maxOkGapMs } = this.liveStats;
             const completed = ok + tasReject + tasError + nrc + timeout + malformed;
             this.record('live_summary', {
-                sent, ok, tasReject, nrc, timeout, malformed,
+                sent, ok, tasReject, nrc, timeout, malformed, maxConsecRej, maxOkGapMs,
                 avgMs: completed ? totalMs / completed : null,
                 passive: this.data.passiveStatus()
             });
-            this.liveStats = newStats();
+            this.liveStats = newLiveStats();
             this.liveSummaryAt = now + LIVE_SUMMARY_INTERVAL;
         }
         if (this.activeSince !== null && this.elapsed(now) >= this.nextRequest) this.readMany(LIVE_DIDS);
@@ -309,6 +317,7 @@ class DiagProbe {
             request.at = now;
             request.deadline = now + WAIT_MS;
             request.hardDeadline = now + this.hardTimeoutMs;
+            if (live) request.gapMs = this.liveDoneAt === null ? null : now - this.liveDoneAt;
             const stats = live ? this.liveStats : this.stats[request.phase];
             stats.sent++;
             if (request.phase === 1) {
@@ -445,6 +454,10 @@ class DiagProbe {
         stats.totalMs += durationMs;
         this.record(outcome, Object.assign({ dids: request.dids.map(hex), durationMs }, fields), request.phase);
         const failed = outcome === 'tasReject' || outcome === 'tasError' || outcome === 'timeout';
+        if (this.mode === 'live') {
+            this.finishLive(request, outcome, failed, now, durationMs);
+            return;
+        }
         if (request.phase === 1) {
             const did = request.dids[0];
             const result = this.discovery.get(did);
@@ -460,6 +473,32 @@ class DiagProbe {
                 this.record('backoff_enter', { backoffMs: this.backoffMs }, request.phase);
             }
         }
+    }
+
+    finishLive(request, outcome, failed, now, durationMs) {
+        const stats = this.liveStats;
+        this.liveDoneAt = now;
+        if (outcome === 'ok') {
+            this.liveConsecRej = 0;
+            if (this.liveLastOkAt !== null) stats.maxOkGapMs = Math.max(stats.maxOkGapMs, now - this.liveLastOkAt);
+            this.liveLastOkAt = now;
+        } else if (failed) {
+            this.liveConsecRej++;
+            stats.maxConsecRej = Math.max(stats.maxConsecRej, this.liveConsecRej);
+        }
+
+        this.expirePower(now);
+        const elapsed = this.elapsed(now);
+        if (failed) {
+            this.nextRequest = elapsed + LIVE_REJECT_GAPS[(this.liveConsecRej - 1) % LIVE_REJECT_GAPS.length];
+        } else if (outcome === 'ok') {
+            this.nextRequest = Math.max(this.nextRequest, elapsed + 200);
+        }
+
+        this.record('live_sample', {
+            reqAt: request.at, durMs: durationMs, gapMs: request.gapMs, out: outcome,
+            streak: this.liveConsecRej
+        });
     }
 
     summarize() {

@@ -14,6 +14,7 @@ const fullBatch = coreBatch.concat(0x4650, 0x4205);
 const tasReject = [0, 0, 0x7F, 0x31, 0x25];
 const tasPending = [0, 0, 0x7F, 0x31, 0x78];
 const ignition = 'FULL_ON_USER_ON';
+const entertainment = 'ENTERTAINMENT_MODE_USER_ON';
 
 function positive(dids) {
     const parts = dids.map(did => {
@@ -501,73 +502,121 @@ async function liveCadence() {
     h.tick(0);
     assert.deepStrictEqual(h.sends[0].dids, batch, 'production always uses the fixed five-DID packet');
     h.advance(160); h.reply();
-    assert.deepStrictEqual(h.data.diagValues.oilPressure, { value: 2.5, at: 160, ttl: 15000 });
+    assert.strictEqual(h.data.diagValues.oilPressure.value, 2.5);
     assert.strictEqual(h.data.snapshot('road').boost, 0.78, 'boost comes from passive FES');
     assert.strictEqual(h.data.diagValues.boost, undefined);
-    h.tick(1499);
-    assert.strictEqual(h.sends.length, 1);
+    h.tick(2999);
+    assert.strictEqual(h.sends.length, 1, 'the first ignition request uses normal cadence from startup');
 
-    for (const t of [1500, 4800, 8100]) {
-        h.tick(t);
-        assert.deepStrictEqual(h.sends[h.sends.length - 1], { time: t, dids: batch });
-        h.tick(t + 3200);
+    let sendAt = 3000;
+    let previousDone = 160;
+    const gaps = [1370, 1890, 2410, 1630, 1370];
+    for (let i = 0; i < gaps.length; i++) {
+        const doneAt = sendAt + 3200;
+        h.tick(sendAt);
+        assert.deepStrictEqual(h.sends[i + 1], { time: sendAt, dids: batch });
+        h.tick(doneAt);
         assert(h.probe.inFlight);
         h.raw(tasReject.concat(0));
         assert.strictEqual(h.probe.inFlight, null, 'long TASU rejections end on arrival');
-        assert.strictEqual(h.data.snapshot('sport').iat, 30, 'a streak of rejections keeps the last good sample');
+        h.tick(doneAt);
+        h.tick(doneAt + gaps[i] - 1);
+        assert.strictEqual(h.sends.length, i + 2, 'the phase-shift gap starts at completion');
+        const { reqAt, durMs, gapMs, out, streak } = h.last('live_sample');
+        assert.deepStrictEqual({ reqAt, durMs, gapMs, out, streak },
+            { reqAt: sendAt, durMs: 3200, gapMs: sendAt - previousDone, out: 'tasReject', streak: i + 1 });
+        if (i < 4) assert.strictEqual(h.data.snapshot('sport').iat, 30, 'four rejections keep the last good sample');
+        previousDone = doneAt;
+        sendAt = doneAt + gaps[i];
     }
-    h.tick(11400);
-    assert.strictEqual(h.sends.length, 5, 'the next tick can recover after three rejections');
-    h.advance(11600); h.reply();
-    assert.deepStrictEqual(h.data.diagValues.iat, { value: 30, at: 11600, ttl: 15000 });
+    h.tick(sendAt);
+    const slowOkAt = sendAt + 2900;
+    h.advance(slowOkAt); h.reply();
+    assert.strictEqual(h.last('live_sample').streak, 0);
+    assert.deepStrictEqual(h.data.diagValues.iat, { value: 30, at: slowOkAt, ttl: 25000 });
+    h.tick(slowOkAt + 199);
+    assert.strictEqual(h.sends.length, gaps.length + 2, 'a slow OK still leaves 200 ms before the next send');
+    h.tick(slowOkAt + 200);
+    h.advance(slowOkAt + 3200); h.error('TAS_CONNECTION_ERROR');
+    assert.strictEqual(h.last('live_sample').streak, 1);
+    h.tick(slowOkAt + 4569);
+    assert.strictEqual(h.sends.length, gaps.length + 3);
+    h.tick(slowOkAt + 4570); h.reply();
+
     h.tick(370000);
-    assert.deepStrictEqual(h.sends[5], { time: 370000, dids: batch }, 'production still sends after six minutes');
+    assert.deepStrictEqual(h.sends[h.sends.length - 1], { time: 370000, dids: batch }, 'production still sends after six minutes');
     h.advance(370200); h.reply();
-    h.tick(371500);
+    h.probe.setPowerState(entertainment);
+    h.probe.setPowerState(ignition);
+    h.tick(373000);
+    h.advance(373160); h.reply();
+    const beforeRestart = h.sends.length;
+    h.tick(375999);
+    assert.strictEqual(h.sends.length, beforeRestart, 'returning to ignition keeps the same cadence');
+    h.tick(376000);
     h.probe.setPowerState(null);
-    h.advance(371700); h.reply();
-    assert.strictEqual(h.data.diagValues.iat.at, 370200, 'a reply in flight at IPC disconnect does not refresh the sample');
-    h.tick(385200);
+    h.advance(376200); h.reply();
+    assert.strictEqual(h.data.diagValues.iat.at, 373160, 'a reply in flight at IPC disconnect does not refresh the sample');
+    const count = h.sends.length;
+    h.tick(398160);
     assert.strictEqual(h.data.snapshot('road').iat, 30);
-    h.tick(385201);
+    h.tick(398161);
     assert.strictEqual(h.data.snapshot('road').iat, null, 'the last sample expires after the IPC disconnect');
-    assert.strictEqual(h.sends.length, 7);
+    assert.strictEqual(h.sends.length, count);
     assert(!h.last('backoff_enter') && !h.last('phase_start') && !h.last('summary'));
 }
 
 async function liveSummary() {
     const h = await harness({ mode: 'live' });
-    h.active();
+    h.probe.setPowerState(entertainment);
+    h.probe.setVisible(true);
     h.probe.observeStatus('tasuModeStatus', 'NO_RESTRICTION');
     h.tick(0); h.advance(150); h.reply();
-    h.tick(1500); h.advance(1650); h.frame([0x62, 0x58, 0x0F]);
-    h.tick(3000); h.advance(3150); h.error('TAS_CONNECTION_ERROR');
-    h.tick(4500); h.advance(4700); h.frame([0x7F, 0x22, 0x31]);
-    h.tick(6000); h.advance(6200); h.raw(tasReject);
-    h.tick(7500);
-    h.advance(10500); h.raw(tasPending);
-    h.advance(13500); h.raw(tasPending);
-    h.advance(15499); h.raw(tasPending);
+    assert.deepStrictEqual(Object.keys(h.last('live_sample')).sort(),
+        ['durMs', 'event', 'gapMs', 'monoMs', 'out', 'phase', 'reqAt', 'streak', 'tsUtc']);
+    const { reqAt, durMs, gapMs, out, streak } = h.last('live_sample');
+    assert.deepStrictEqual({ reqAt, durMs, gapMs, out, streak },
+        { reqAt: 0, durMs: 150, gapMs: null, out: 'ok', streak: 0 });
+    h.tick(3000); h.advance(3150); h.frame([0x62, 0x58, 0x0F]);
+    h.tick(6000); h.advance(6150); h.error('TAS_CONNECTION_ERROR');
+    h.tick(9000); h.advance(9200); h.frame([0x7F, 0x22, 0x31]);
+    h.tick(12000); h.advance(12200); h.raw(tasReject);
+    h.tick(15000);
+    h.advance(18000); h.raw(tasPending);
+    h.advance(21000); h.raw(tasPending);
+    h.advance(22999); h.raw(tasPending);
     assert(h.probe.inFlight);
-    h.tick(15500);
+    h.tick(23000);
     assert.strictEqual(h.probe.inFlight, null, 'live requests retain the 8s hard deadline');
+    assert.strictEqual(h.last('live_sample').streak, 3, 'the streak counts errors, rejections and timeouts');
     h.reply();
-    h.tick(17499);
+    h.tick(24999);
     assert.strictEqual(h.sends.length, 6, 'live also observes the two-second timeout drain');
+    h.tick(25409);
+    assert.strictEqual(h.sends.length, 6, 'the third rejection gap still applies after the drain');
     h.probe.setVisible(false);
 
     h.tick(59999);
     assert(!h.last('live_summary'));
     h.tick(60000);
-    const { sent, ok, tasReject: rejects, nrc, timeout, malformed, avgMs, passive } = h.last('live_summary');
-    assert.deepStrictEqual({ sent, ok, rejects, nrc, timeout, malformed, avgMs, passive },
-        { sent: 6, ok: 1, rejects: 1, nrc: 1, timeout: 1, malformed: 1, avgMs: 8850 / 6, passive: h.data.passiveStatus() });
+    const { sent, ok, tasReject: rejects, nrc, timeout, malformed, avgMs, passive, maxConsecRej, maxOkGapMs } = h.last('live_summary');
+    assert.deepStrictEqual({ sent, ok, rejects, nrc, timeout, malformed, avgMs, passive, maxConsecRej, maxOkGapMs },
+        { sent: 6, ok: 1, rejects: 1, nrc: 1, timeout: 1, malformed: 1, avgMs: 8850 / 6,
+            passive: h.data.passiveStatus(), maxConsecRej: 3, maxOkGapMs: null });
+    h.probe.setVisible(true);
+    h.tick(62000); h.advance(62160); h.reply();
+    h.tick(65000); h.advance(65120); h.reply();
+    h.probe.setVisible(false);
     h.tick(120000);
+    assert.strictEqual(h.last('live_summary').maxConsecRej, 0);
+    assert.strictEqual(h.last('live_summary').maxOkGapMs, 62160 - 150, 'the first success includes the gap across minutes');
+    h.tick(180000);
     assert.strictEqual(h.last('live_summary').sent, 0, 'summary counters restart each minute');
     assert.strictEqual(h.last('live_summary').avgMs, null);
-    assert.strictEqual(h.events.filter(e => e.event === 'live_summary').length, 2);
+    assert.strictEqual(h.last('live_summary').maxOkGapMs, null);
+    assert.strictEqual(h.events.filter(e => e.event === 'live_summary').length, 3);
     assert.deepStrictEqual(Array.from(new Set(h.events.map(e => e.event))).sort(),
-        ['gate', 'live_summary', 'malformed', 'status_change', 'tasError']);
+        ['gate', 'live_sample', 'live_summary', 'malformed', 'status_change', 'tasError']);
 }
 
 function verifyConfigs(sessionDir) {
@@ -685,5 +734,5 @@ function verifyJsonl() {
         console.log('SKIP: native TASU schema comparison requires local interface fixtures');
     }
     verifyJsonl();
-    console.log('PASS: continuous live cadence and TTL, minute summaries, probe stages, deadlines and drain, JSONL rotation');
+    console.log('PASS: 3s live cadence from ignition, completion-based retry gaps, 25s TTL, timing logs, probe stages, deadlines and drain, JSONL rotation');
 })().catch(e => { console.error(e); process.exitCode = 1; });
