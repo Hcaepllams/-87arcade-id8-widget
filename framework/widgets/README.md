@@ -101,10 +101,25 @@ idrive-apps/native/cluster-render/build/host/dcsm27_port_test
 
 本地验证覆盖两组件互斥、各布局独立选择、服务重新启动后从文件恢复、提供方重新连接、注册重复执行、稳定标识及统一电源监听。87 Arcade 已使用公共运行时完成本地图层检查。
 
-2026-11-22 已在车上部署公共 manager/runtime/lifecycle 与组件注册配置。沿用已登记且启用的 club-dashboard.service，通过其 run.sh 启动 manager，避免另行登记重复自启入口。manager 已启动 87 Arcade，renderer 从文件加载了两个模式的选择，300ms 后请求显示并收到 DCSM shown。名称已配置为 87 Arcade，缩略图已部署完整 logo PNG。长时间车辆休眠、两个真实组件切换、原厂页面手动选择后的保留，仍须实车回归。现有 DCSM hide/release 不能单独识别“用户选择原厂页面”和“系统临时覆盖”，该识别问题统一留在框架层处理。
+2026-11-22 已在车上部署公共 manager/runtime/lifecycle 与组件注册配置。沿用已登记且启用的 club-dashboard.service，通过其 run.sh 启动 manager，避免另行登记重复自启入口。manager 已启动 87 Arcade，renderer 从文件加载了两个模式的选择，300ms 后请求显示并收到 DCSM shown。名称已配置为 87 Arcade，缩略图已部署完整 logo PNG。2026-11-23 用户确认隔夜断电后重新启动仍能恢复选择。两个真实组件切换、原厂页面手动选择后的保留，仍须实车回归。现有 DCSM hide/release 不能单独识别“用户选择原厂页面”和“系统临时覆盖”，该识别问题统一留在框架层处理。
 
 ## Renderer 补丁
 
 ../../patches/cluster-render-v3.patch 基于上游 88e8554b1d81593d85f8095b4f0c38213223990d，包含原 v2.3 与本次共享选择、配置注册和持久化改动。将补丁应用到该上游版本后构建。已应用补丁的工作区不能重复应用。若保留本仓库根目录应用结构，可将其链接到 apps 根目录的 club-dashboard 项，管理器通过 app.json 读取入口。
 
 本次 Linux 专项端口测试及 ID8 二进制构建、137 个 RAMSES 导入检查通过。macOS 的完整 service_test 通过。Linux 的 service_test 仍失败于此前实验记录中也出现过的“and each repeat as the last frame whole again, newest id”视频重复帧用例。该项没有修改，不能宣称 Linux 全套测试通过。
+
+## 组件驾驶状态（本地新增，尚未部署）
+
+公共 runtime 向 createData(storage) 提供按组件 ID 隔离的原子文件存储，文件位于 /var/opt/id8-widgets/state/<id>.json。storage 带当前 boot ID。manager 复用已有 Lifecycle 订阅，将电源状态转发给组件的 data.powerState，不新增每组件订阅。
+
+87 Arcade 用它保存本轮驾驶 G 值极值的凸包顶点。切换布局或同一次启动内重启组件保留极值轮廓；关机/休眠后下一次 FULL_ON_USER_ON 或 boot ID 改变开始新一轮。欢迎提示或重复 FULL 不清零。新一轮先清除旧加速度缓存，等待新信号。拖影仅保留最近 2 秒，不写入文件；只有极值轮廓扩展或驾驶状态变化时落盘。
+
+本地独立进程存取、模式切换、轨迹过期、新驾驶清零与重启测试通过。真实车辆的本轮边界和极值轮廓保留尚未验证。部署这些新功能需同时更新 state.js、runtime.js、manager.js、lifecycle.js、widget.js、vehicle-data.js、g-history.js 和 render.js，不能只替换绘图文件。
+
+
+## Widget 偏好设置（2026-11-27）
+
+widget 的 app.json 可声明 `preferences` 指向其配置模型 JS，导出 `defaults/copy/validate`。manager 用公共 preferences.js 提供本地 socket 和原子磁盘保存；写入成功后通过 `widget-settings` IPC 更新子进程，runtime 将配置作为第三个参数传给 render。未声明的 widget 沿用原行为，组件身份、选择记忆与唤醒恢复链路不变。
+
+87 Arcade 设置 App 的集成、路径和验证边界见 `../../cid-settings/README.md`。偏好设置与驾驶 G 历史分文件保存。配置服务必须与新 runtime 一起部署，不能只安装中控设置 App。

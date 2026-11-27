@@ -6,5 +6,6 @@
   "entry": "render.js",
   "description": "One widget: four tyre pressures and temperatures, seven powertrain readings with bars. SPORT also shows live G, fading trail and trip envelope.",
   "preview": "assets/preview.png",
-  "vehicle": "widget.js"
+  "vehicle": "widget.js",
+  "preferences": "settings.js"
 }

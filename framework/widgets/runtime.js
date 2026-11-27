@@ -3,12 +3,35 @@
 const path = require('path');
 const { appState } = require('./state');
 
-function uploadFrame(cr, layer) {
+const INTRO_MS = 1000;
+const UPLOAD_BYTES_PER_SECOND = 5500 * 1024;
+const MAX_DIRTY = 16; // ClusterRender sends a whole image past this many rectangles.
+
+function bounds(a, b) {
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    return {x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y};
+}
+
+// Bound both the number of protocol rectangles and the cost of planning a fragmented frame.
+function mergeRegions(rects) {
+    while (rects.length > MAX_DIRTY) {
+        let first, second, best = Infinity;
+        for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
+            const a = rects[i], b = rects[j], box = bounds(a, b);
+            const cost = box.w * box.h - a.w * a.h - b.w * b.h;
+            if (cost < best) { first = i; second = j; best = cost; }
+        }
+        rects[first] = bounds(rects[first], rects[second]);
+        rects.splice(second, 1);
+    }
+}
+
+function uploadFrame(layer, sendPixels) {
     const { canvas, prevPixels, ref } = layer;
     const { w, h, d } = canvas;
     const pixels = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
     if (!prevPixels) {
-        if (cr.pixels(ref, null, pixels)) layer.prevPixels = Buffer.from(pixels);
+        if (sendPixels(ref, null, pixels)) layer.prevPixels = Buffer.from(pixels);
         return;
     }
     if (pixels.equals(prevPixels)) return;
@@ -17,26 +40,32 @@ function uploadFrame(cr, layer) {
     const previous = new Uint32Array(prevPixels.buffer, prevPixels.byteOffset, w * h);
     const rects = [];
     // Separate the changing display regions so their gaps are not uploaded.
-    const stripWidth = Math.ceil(w / 3);
+    const stripWidth = Math.ceil(w / 8);
     for (let start = 0; start < w; start += stripWidth) {
         const end = Math.min(w, start + stripWidth);
-        let left = end, right = -1, top = h, bottom = -1;
+        let region;
         for (let y = 0, row = 0; y < h; y++, row += w) {
             let x = start;
             while (x < end && next[row + x] === previous[row + x]) x++;
             if (x === end) continue;
             let last = end - 1;
             while (last > x && next[row + last] === previous[row + last]) last--;
-            left = Math.min(left, x);
-            right = Math.max(right, last);
-            top = Math.min(top, y);
-            bottom = y;
+            if (!region || y > region.y + region.h + 2) {
+                if (rects.length === MAX_DIRTY * 2) mergeRegions(rects);
+                region = {x, y, w: last - x + 1, h: 1};
+                rects.push(region);
+            } else {
+                const right = Math.max(region.x + region.w, last + 1);
+                region.x = Math.min(region.x, x);
+                region.w = right - region.x;
+                region.h = y - region.y + 1;
+            }
         }
-        if (bottom >= 0) rects.push({ x: left, y: top, w: right - left + 1, h: bottom - top + 1 });
     }
+    mergeRegions(rects);
     const dirtyBytes = rects.reduce((sum, rect) => sum + rect.w * rect.h * 4, 0);
     if (dirtyBytes + rects.length * 8 >= pixels.length) {
-        if (cr.pixels(ref, null, pixels)) pixels.copy(prevPixels);
+        if (sendPixels(ref, null, pixels)) pixels.copy(prevPixels);
         return;
     }
     const patch = Buffer.allocUnsafe(dirtyBytes);
@@ -49,7 +78,7 @@ function uploadFrame(cr, layer) {
             dest += rowBytes;
         }
     }
-    if (cr.pixels(ref, rects, patch)) pixels.copy(prevPixels);
+    if (sendPixels(ref, rects, patch)) pixels.copy(prevPixels);
 }
 
 function run(directory, target) {
@@ -66,9 +95,21 @@ function run(directory, target) {
         sport: { x: 774, y: 170, w: 760, h: 556 }
     };
     const data = plugin.createData(appState(manifest.id)), subscriptions = [], log = { info: console.log, warn: console.error };
+    let settings, sleeping = false;
+    let introStarted = false, introAt = 0, limitUntil = 0;
+    const recentUploads = [];
     const probe = plugin.createDiagProbe && plugin.createDiagProbe(data, signals, log);
     process.on('message', message => {
+        if (message.type === 'widget-settings') {
+            settings = message.config;
+            if (probe) probe.setCoexistence(Boolean(settings && settings.obdCoexistence));
+            renderFrame();
+            return;
+        }
         if (message.type !== 'power-state') return;
+        const asleep = /SHUTDOWN|OFF|SLEEP/i.test(message.state);
+        if (asleep && !sleeping) { introStarted = false; introAt = 0; limitUntil = 0; }
+        sleeping = asleep;
         if (data.powerState) data.powerState(message.state);
         if (probe) probe.setPowerState(message.state);
     });
@@ -83,7 +124,15 @@ function run(directory, target) {
     });
     cr.on('target', (t, state, holder, reason) => {
         console.log('target', t, state, reason || '');
-        if (probe && t === target) probe.setVisible(state === 'shown');
+        if (t !== target) return;
+        if (probe) probe.setVisible(state === 'shown');
+        if (state === 'shown' && !introStarted && !sleeping) {
+            introStarted = true;
+            introAt = Date.now();
+            // Include sliding one-second windows that straddle the handoff to live data.
+            limitUntil = introAt + INTRO_MS + 1000;
+            renderFrame();
+        }
     });
     if (probe) cr.on('disconnected', () => probe.setVisible(false));
     function dropPending() {
@@ -126,7 +175,10 @@ function run(directory, target) {
             group.optional = group.optional && optional;
             group.fields[field] = v => data.receive(field, v);
         }
-        await watch('de.bmw.infotainment.vehicle.Vehicle2', '1', {
+        const vehicle = 'de.bmw.infotainment.vehicle.Vehicle2';
+        const vehicleSignals = byInterface[vehicle];
+        delete byInterface[vehicle];
+        const vehicleFields = Object.assign({}, vehicleSignals && vehicleSignals.fields, {
             statusDisplayKombi: v => {
                 const n = v && v.statusDisplayInstrumentPackM;
                 if (n === 0 || n === 'KEINE_AENDERUNG') { if (mode) modeAt = Date.now(); return; }
@@ -135,7 +187,8 @@ function run(directory, target) {
                 modeAt = Date.now();
                 if (mode !== previous) renderFrame();
             }
-        }, false, 2000);
+        });
+        await watch(vehicle, '1', vehicleFields, false, 2000);
         for (const iface of Object.keys(byInterface)) {
             const { fields, optional } = byInterface[iface];
             await watch(iface, '1', fields, optional, /CDS2$/.test(iface) ? 500 : /TPMS$/.test(iface) ? 10000 : 2000);
@@ -158,6 +211,20 @@ function run(directory, target) {
         cr.close();
         Promise.all(subscriptions.map(s => s.shutdown())).then(() => process.exit(code));
         setTimeout(() => process.exit(code), 1000);
+    }
+    function sendPixels(ref, rects, pixels) {
+        if (introStarted && !limitUntil) return cr.pixels(ref, rects, pixels);
+        const now = Date.now();
+        while (recentUploads.length && recentUploads[0].at <= now - 1000) recentUploads.shift();
+        if (now >= limitUntil) limitUntil = 0;
+        const bytes = pixels.length + 19 + (rects ? rects.length * 8 : 0);
+        if (limitUntil) {
+            const total = recentUploads.reduce((sum, upload) => sum + upload.bytes, bytes);
+            if (total > UPLOAD_BYTES_PER_SECOND || cr.blocked) return false;
+        }
+        if (!cr.pixels(ref, rects, pixels)) return false;
+        recentUploads.push({at:now, bytes});
+        return true;
     }
     function renderFrame() {
         if (!cr.ready || stopping) return;
@@ -187,8 +254,14 @@ function run(directory, target) {
                 layer.visible = true;
                 cr.set(layer.ref, { visible: true });
             }
-            render(layer.canvas, data.snapshot(mode));
-            uploadFrame(cr, layer);
+            let frame = data.snapshot(mode);
+            if (introAt) {
+                const intro = Math.min(1, (Date.now() - introAt) / INTRO_MS);
+                frame = Object.assign({}, frame, {intro});
+                if (intro === 1) introAt = 0;
+            }
+            render(layer.canvas, frame, settings);
+            uploadFrame(layer, sendPixels);
             skipRoadTick = mode === 'road';
         } catch (e) { console.error(e.stack); stop(1); }
     }

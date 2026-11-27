@@ -13,9 +13,10 @@ const PHASES = [
 const CADENCE = [0, 3000, 0, 5000, 1500, 1500, 0];
 const DEFAULT_DIDS = [0x580F, 0x586F, 0x4201, 0x5658];
 const LIVE_DIDS = DEFAULT_DIDS.concat(0x4650);
-const LIVE_CADENCE = 3000, LIVE_TTL = 25000, LIVE_SUMMARY_INTERVAL = 60000;
-const LIVE_REJECT_GAPS = [1370, 1890, 2410, 1630];
-const LIVE_EVENTS = new Set(['gate', 'status_change', 'malformed', 'tasError', 'live_sample', 'live_summary']);
+const LIVE_SUMMARY_INTERVAL = 60000;
+const LIVE_NORMAL = { cadence: 1000, ttl: 10000, rejectGaps: [800, 1200, 1600] };
+const LIVE_COEXISTENCE = { cadence: 3000, ttl: 25000, rejectGaps: [1370, 1890, 2410, 1630] };
+const LIVE_EVENTS = new Set(['gate', 'status_change', 'malformed', 'tasError', 'live_sample', 'live_summary', 'coexistence_change']);
 const ALTERNATE_DIDS = { 0x586F: 0x4436, 0x5658: 0x58EF };
 const UNSUPPORTED_NRC = new Set(['0x11', '0x12', '0x31']);
 const DID_SPECS = [
@@ -122,6 +123,7 @@ class DiagProbe {
         this.nextUnsolicitedAt = 0;
         if (this.mode === 'probe') this.resetRound();
         else {
+            this.liveProfile = LIVE_NORMAL;
             this.nextRequest = 0;
             this.liveStats = newLiveStats();
             this.liveConsecRej = 0;
@@ -168,6 +170,14 @@ class DiagProbe {
         if (JSON.stringify(this.status[key]) === JSON.stringify(value)) return;
         this.status[key] = value;
         this.record('status_change', { signal: key, value });
+    }
+
+    setCoexistence(enabled) {
+        const profile = enabled ? LIVE_COEXISTENCE : LIVE_NORMAL;
+        if (this.mode !== 'live' || this.liveProfile === profile) return;
+        this.liveProfile = profile;
+        if (!this.inFlight) this.nextRequest = Math.min(this.nextRequest, this.elapsed(this.clock()) + profile.cadence);
+        this.record('coexistence_change', { obdCoexistence: enabled });
     }
 
     setVisible(visible) {
@@ -297,7 +307,7 @@ class DiagProbe {
     readMany(dids) {
         checkRequest(DME, READ_DID, dids);
         const live = this.mode === 'live';
-        const cadence = live ? LIVE_CADENCE : CADENCE[this.phase];
+        const cadence = live ? this.liveProfile.cadence : CADENCE[this.phase];
         if (!cadence || this.inFlight || !this.subscription || !this.subscription.available ||
             this.backoffUntil !== null || this.clock() < this.drainUntil) return;
         const request = { phase: live ? null : this.phase, dids: dids.slice(), deadline: Infinity, hardDeadline: Infinity, at: null };
@@ -317,14 +327,17 @@ class DiagProbe {
             request.at = now;
             request.deadline = now + WAIT_MS;
             request.hardDeadline = now + this.hardTimeoutMs;
-            if (live) request.gapMs = this.liveDoneAt === null ? null : now - this.liveDoneAt;
+            if (live) {
+                request.gapMs = this.liveDoneAt === null ? null : now - this.liveDoneAt;
+                request.elapsed = elapsed;
+            }
             const stats = live ? this.liveStats : this.stats[request.phase];
             stats.sent++;
             if (request.phase === 1) {
                 const did = this.discoveryQueue.shift();
                 this.discovery.get(did).attempts++;
             }
-            this.nextRequest = elapsed + cadence;
+            this.nextRequest = elapsed + (live ? this.liveProfile.cadence : cadence);
             this.record('request', { dids: request.dids.map(hex) }, request.phase);
             return this.subscription.proxy.callMethod(name, params, ms);
         } };
@@ -436,7 +449,7 @@ class DiagProbe {
             Object.assign(details, { boostAbsBar: values.boostAbs, ambientBar, ambientSource, boostGaugeBar: values.boost });
         }
         if (!live && phase < 3) return;
-        const ttl = live ? LIVE_TTL : phase === 3 ? 12000 : 6000;
+        const ttl = live ? this.liveProfile.ttl : phase === 3 ? 12000 : 6000;
         for (const key of ['iat', 'oilPressure', 'fuelRail', 'gearbox', 'boost']) {
             if (values[key] !== undefined) this.data.receiveDiag(key, values[key], ttl);
         }
@@ -490,9 +503,10 @@ class DiagProbe {
         this.expirePower(now);
         const elapsed = this.elapsed(now);
         if (failed) {
-            this.nextRequest = elapsed + LIVE_REJECT_GAPS[(this.liveConsecRej - 1) % LIVE_REJECT_GAPS.length];
+            const gaps = this.liveProfile.rejectGaps;
+            this.nextRequest = elapsed + gaps[(this.liveConsecRej - 1) % gaps.length];
         } else if (outcome === 'ok') {
-            this.nextRequest = Math.max(this.nextRequest, elapsed + 200);
+            this.nextRequest = Math.max(request.elapsed + this.liveProfile.cadence, elapsed + 200);
         }
 
         this.record('live_sample', {

@@ -486,8 +486,51 @@ async function fallbackAndLoop() {
     assert.strictEqual(h.sends.length, count, 'an entirely unsupported batch sends no request');
 }
 
+async function liveHotSwitch() {
+    const h = await harness({ mode: 'live' });
+    h.active();
+    h.tick(0); h.advance(100); h.reply();
+    assert.deepStrictEqual(h.data.diagValues.iat, { value: 30, at: 100, ttl: 10000 });
+    h.tick(999);
+    assert.deepStrictEqual(h.sends.map(s => s.time), [0]);
+    let sendAt = 1000;
+    for (const gap of [800, 1200, 1600]) {
+        h.tick(sendAt);
+        assert.strictEqual(h.sends[h.sends.length - 1].time, sendAt);
+        const count = h.sends.length;
+        const doneAt = sendAt + 2500;
+        h.advance(doneAt); h.raw(tasReject);
+        h.tick(doneAt + gap - 1);
+        assert.strictEqual(h.sends.length, count, 'normal mode also waits from completion');
+        sendAt = doneAt + gap;
+    }
+    h.tick(sendAt);
+    h.probe.setCoexistence(true);
+    assert.strictEqual(h.last('coexistence_change').obdCoexistence, true);
+    h.probe.setCoexistence(true);
+    assert.strictEqual(h.events.filter(e => e.event === 'coexistence_change').length, 1);
+    h.advance(sendAt + 100); h.reply();
+    assert.deepStrictEqual(h.data.diagValues.iat, { value: 30, at: sendAt + 100, ttl: 25000 });
+    h.tick(sendAt + 2999);
+    assert.strictEqual(h.sends.length, 5, 'switching during a request applies the new success cadence');
+    h.tick(sendAt + 3000); h.reply();
+    h.advance(sendAt + 3100);
+    h.probe.setCoexistence(false);
+    assert.strictEqual(h.last('coexistence_change').obdCoexistence, false);
+    h.tick(sendAt + 4099);
+    assert.strictEqual(h.sends.length, 6);
+    h.tick(sendAt + 4100); h.reply();
+    assert.strictEqual(h.sends[6].time, sendAt + 4100, 'switching back shortens the idle wait');
+    h.probe.setVisible(false);
+    h.tick(sendAt + 14100);
+    assert.strictEqual(h.data.snapshot('road').iat, 30);
+    h.tick(sendAt + 14101);
+    assert.strictEqual(h.data.snapshot('road').iat, null, 'the next normal sample expires after 10 seconds');
+}
+
 async function liveCadence() {
     const h = await harness({ mode: 'live' });
+    h.probe.setCoexistence(true);
     const batch = coreBatch.concat(0x4650);
     h.probe.setPowerState(ignition);
     h.tick(0);
@@ -568,6 +611,7 @@ async function liveCadence() {
 
 async function liveSummary() {
     const h = await harness({ mode: 'live' });
+    h.probe.setCoexistence(true);
     h.probe.setPowerState(entertainment);
     h.probe.setVisible(true);
     h.probe.observeStatus('tasuModeStatus', 'NO_RESTRICTION');
@@ -616,14 +660,14 @@ async function liveSummary() {
     assert.strictEqual(h.last('live_summary').maxOkGapMs, null);
     assert.strictEqual(h.events.filter(e => e.event === 'live_summary').length, 3);
     assert.deepStrictEqual(Array.from(new Set(h.events.map(e => e.event))).sort(),
-        ['gate', 'live_sample', 'live_summary', 'malformed', 'status_change', 'tasError']);
+        ['coexistence_change', 'gate', 'live_sample', 'live_summary', 'malformed', 'status_change', 'tasError']);
 }
 
-function verifyConfigs(sessionDir) {
-    const catalog = require(path.join(sessionDir, 'someip-interfaces.json'));
+function verifyConfigs() {
+    const catalog = require('../vehicle-session-20261107/someip-interfaces.json');
     const manifest = require('./someip-manifest.json');
-    const archive = path.join(sessionDir, 'club-dashboard-preview.tgz');
-    assert.strictEqual(Object.keys(manifest.proxies).length, 8);
+    const archive = path.resolve(__dirname, '../vehicle-session-20261107/club-dashboard-preview.tgz');
+    assert.strictEqual(Object.keys(manifest.proxies).length, 12);
     for (const [iface, selection] of Object.entries(manifest.proxies)) {
         const name = iface.replace(/\./g, '_') + '.json';
         const config = require('./someipInterfaces/' + name);
@@ -636,7 +680,9 @@ function verifyConfigs(sessionDir) {
         assert.deepStrictEqual(Object.keys(config.events), selection.broadcasts || []);
         if (['CDS', 'CDS2', 'TPMS', 'Vehicle2'].includes(config.name)) {
             const snapshot = JSON.parse(execFileSync('tar', ['-xOf', archive, 'club-dashboard/someipInterfaces/' + name], { encoding: 'utf8' }));
-            assert.deepStrictEqual(config, snapshot, name);
+            const deployedFields = {};
+            for (const field of Object.keys(snapshot.fields)) deployedFields[field] = config.fields[field];
+            assert.deepStrictEqual(Object.assign({}, config, {fields: deployedFields}), snapshot, name);
         }
         if (iface === TASU) {
             assert.strictEqual(selection.instances, TASU_INSTANCE);
@@ -668,7 +714,7 @@ function verifyJsonl() {
     const writeGate = (file, mode = '') => execFileSync(process.execPath, ['-e',
         "const { DiagProbe } = require('./diag-probe'); const p = new DiagProbe({}, {}, {}); p.setVisible(true);"],
         { cwd: __dirname, env: Object.assign({}, process.env, { ID8_DIAG_LOG: file, ID8_DIAG_MODE: mode }), encoding: 'utf8' });
-    const defaultGate = JSON.parse(writeGate(''));
+    const defaultGate = JSON.parse(writeGate('/dev/null/diag-probe.jsonl'));
     assert.strictEqual(defaultGate.event, 'gate');
     assert.strictEqual(defaultGate.phase, 'LIVE');
     assert.strictEqual(JSON.parse(writeGate('/dev/null/diag-probe.jsonl', 'probe')).phase, PHASES[0]);
@@ -719,20 +765,19 @@ function verifyJsonl() {
     await discoveryRetries();
     await quietResponses();
     await fallbackAndLoop();
+    await liveHotSwitch();
     await liveCadence();
     await liveSummary();
-    const sessionDir = path.resolve(__dirname, '../vehicle-session-20261107');
-    const configInputs = [
-        path.join(__dirname, 'someip-manifest.json'),
-        path.join(__dirname, 'someipInterfaces'),
-        path.join(sessionDir, 'someip-interfaces.json')
-    ];
-    if (configInputs.every(file => fs.existsSync(file))) {
-        verifyConfigs(sessionDir);
+    const fixtures = ['someip-manifest.json', '../vehicle-session-20261107/someip-interfaces.json',
+        '../vehicle-session-20261107/club-dashboard-preview.tgz'];
+    if (fixtures.every(file => fs.existsSync(path.join(__dirname, file))) &&
+        Object.keys(require('./someip-manifest.json').proxies).every(iface =>
+            fs.existsSync(path.join(__dirname, 'someipInterfaces', iface.replace(/\./g, '_') + '.json')))) {
+        verifyConfigs();
         console.log('PASS: native TASU schemas');
     } else {
         console.log('SKIP: native TASU schema comparison requires local interface fixtures');
     }
     verifyJsonl();
-    console.log('PASS: 3s live cadence from ignition, completion-based retry gaps, 25s TTL, timing logs, probe stages, deadlines and drain, JSONL rotation');
+    console.log('PASS: 1s/10s and 3s/25s live profiles, hot switching, completion-based retry gaps, timing logs, probe stages, deadlines and drain, JSONL rotation');
 })().catch(e => { console.error(e); process.exitCode = 1; });

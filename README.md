@@ -2,27 +2,35 @@
 
 `render.js` 使用上游 Canvas 绘图与离线烘焙字体（`assets/fonts/arcade-num.json`、`arcade-label.json`，Barlow Semi Condensed Bold/SemiBold），不依赖浏览器 DOM。网页模拟器和车端 `vehicle.js` / `widget.js` 调用同一绘制函数。
 
-## 布局与视觉（2026-11-26 实车验证版）
+## 仪表布局（2026-11-27）
 
-- **ROAD（`1120 × 660 @ (560, 125)`，5 fps）**：左中右三栏严格中轴对称布局，顶部 `y < 152` 完整避让 CarPlay 导航条，全部主数值与标签命中原生烘焙字号（56px / 30px / 20px），车机 Node v8.16.2 缓存帧耗时约 14 ms：
-  - 左栏（`x = 48..362`）：油温、水温、变速箱油温、进气温度 4 行铺满全高，配 274px 满宽进度条。
-  - 中栏（`x = 376..744`，中心 `x = 560`）：四轮胎压（56px 一位小数）与胎温（30px），下方绝对居中放置 220 × 92 的 `87 ARCADE` 字标。
-  - 右栏（`x = 758..1072`）：机油压力、高压燃油压力、涡轮增压 3 行与左栏镜像对称，配 274px 满宽进度条（BOOST 保留零刻度线）。
-- **SPORT（`760 × 556 @ (774, 170)`，10 fps）**：按实车硬裁切线与左侧亮蓝斜边标定为紧凑三栏，缓存帧耗时约 7 ms。左栏显示四轮胎压胎温与下方 `87 ARCADE` 字标（150 × 63）；中栏为放大的 G 仪表（半径 108，含红点、2 秒渐隐轨迹、本次驾驶金色极值凸包）与正下方 48px 合成 G；右栏取消进度条，单排清晰显示 7 项动力数据。
-- **协调暗底衬**：数据区背后在静态缓存层绘制深海蓝半透明圆角底衬（`#050d1888`）与细描边，栏间及顶部导航净区保持全透明。
-- **温度与缺失规则**：油水温沿用低温蓝 / 正常白 / 高温红提示（原型默认阈值：油温 `<70°C / ≥125°C`，水温 `<60°C / ≥112°C`，非原厂标定报警阈值）；缺失或过期值降暗显示 `--`。G 值图坐标采用左正、上方制动、下方加速。
+ROAD（1120 × 660，5 fps）和 SPORT（760 × 556，10 fps）可分别设置 1 至 3 栏。各栏可等宽，也可选一栏作为加宽主视图。每栏可放轮胎、G 表或数据卡，数据卡支持从 28 项指标中选择并排序。空间充足时显示带刻度游标的横条，项目较多时改用紧凑行，宽栏可分两列。缩窄后用 `+N` 标出暂时放不下的项目，保留原有选择。
+
+卡片采用 BMW ID8 / G87 M2 Live Cockpit 的视觉风格，深碳黑底色配顶部细光带。胎压和胎温沿俯视底盘轮廓标出对应车轮，G 表用精细准线标出横纵向加速度，并保留 2 秒轨迹与本次驾驶的极值轮廓。仪表顶部为导航留空。
+
+温度和压力可按指标设置颜色阈值。低温显示蓝色，低压显示琥珀色，达到高限显示红色；读数缺失或过期显示 `--`。阈值用于显示提示。组件首次显示时播放 1 秒启动动画，随后切回实时读数。动画与常态绘制共用每秒 5,500 KiB 的上传预算。
 
 ## 数据采集与温和共存诊断
 
 - **被动 SOME/IP**：油温/水温（CDS）、四轮胎压胎温（TPMS）、横纵向 G（CDS2）、仪表模式（Vehicle2）及实际涡轮增压（FES `displayBoostPressure`）。
 - **常驻只读诊断（`diag-probe.js`）**：默认运行 `ID8_DIAG_MODE=live`，仅在组件可见（`shown`）且处于有效点火电源状态时，向 DME (`0x12`) 发送单帧只读 UDS `0x22` 请求，读取 5 个 S58 实车验证 DID（`0x580F` 进气温度、`0x586F` 机油绝压与 `0x4201` 大气压折算表压、`0x5658` 高压燃油压力、`0x4650` 变速箱油温）。
-- **温和共存策略（不卡外接方向盘转速灯）**：成功回包后按 **3 秒**常态节拍调度（把 93% 以上 OBD 通道时间留给外接方向盘设备）；遇到 `tasReject` / 超时 / 传输错误后，从完成时刻起按非等距序列 **`1370 / 1890 / 2410 / 1630 ms`** 轮换等待（彻底打破零间隔重发引发的 20 分钟锁相，同时留出 1.4 到 2.4 秒的通道恢复窗）；诊断读数保鲜期 **25 秒**；记录精简 `live_sample` 与每分钟 `live_summary`（含 `maxConsecRej` 和 `maxOkGapMs`）。
+共存开关 `obdCoexistence` 可在中控设置中即时切换。退避从本次请求结束时起算，遇到拒绝、超时或传输错误时按表中顺序轮换。
+
+| OBD 共存 | 正常采样间隔 | 读数有效期 | 退避等待（ms） |
+| --- | --- | --- | --- |
+| 关闭（默认） | 1 秒 | 10 秒 | 800 / 1200 / 1600 |
+| 开启 | 3 秒 | 25 秒 | 1370 / 1890 / 2410 / 1630 |
+
 - **模式与日志控制**：设置 `ID8_DIAG_MODE=probe` 可切回六阶段对照实验，设置 `ID8_DIAG_PROBE=0` 可关闭主动诊断；设置 `ID8_DIAG_LOG` 可将 JSONL 日志写入指定文件（超过 5 MiB 自动轮转为 `.1`）。
 - **G 极值持久化（`g-history.js`）**：对本次驾驶凸包做 `0.01 g` 量化并上限 64 个角向顶点，通过 `framework/widgets/state.js` 原子持久化保存，按熄火休眠或系统重启开启新一轮驾驶统计。
 
+## 中控设置
+
+`cid-settings/` 提供原生 BMW ID8 中控设置应用 `arcade_settings 0.1.3`。启动器使用固定的 87 ARCADE 官方图标，页面左上角显示俱乐部字标。`mgu-render/1` 图形界面按中控屏可用宽度铺满，支持触摸和 CCU 旋钮，也可回退到原生 RHMI 列表。保存后，设置应用通过本地 Unix socket 将配置交给 manager；manager 原子写盘，再通过 IPC 通知仪表重绘，无需重启。构建依赖见[中控设置说明](cid-settings/README.md)。
+
 ## 当前架构
 
-`widget.js` 提供绘图函数、信号声明、数据转换与诊断探针入口。`framework/widgets/runtime.js` 负责连接、仪表模式切换（ROAD 5 fps / SPORT 10 fps）和按横向三分区脏矩形 RGBA 上传（与普通模式三栏区间天然对齐，SPORT 10 fps 峰值带宽约 1,935 KiB/s，低于 5,500 KiB/s 预算）；`manager.js` 统一启动已注册组件并转发 `lifecycle.js` 的车辆电源状态。修改后的 cluster-render 统一处理各模式的选择记忆、切换恢复与启动恢复。
+`widget.js` 提供绘图函数、信号声明、数据转换与诊断探针入口。`framework/widgets/runtime.js` 负责连接、仪表模式切换（ROAD 5 fps / SPORT 10 fps）和按横向三分区脏矩形 RGBA 上传。`manager.js` 统一启动已注册组件并转发 `lifecycle.js` 的车辆电源状态。修改后的 cluster-render 统一处理各模式的选择记忆、切换恢复与启动恢复。
 
 组件名称为 **87 Arcade**，菜单缩略图使用 `assets/preview.png` 中的完整俱乐部 Logo。`app.json` 同时声明名称、缩略图与组件入口，不是 MGU Store 安装清单。
 
@@ -42,6 +50,8 @@
 
 ```sh
 node framework/widgets/check.js
+node settings.test.js
+node cid-settings/lifecycle.test.js
 node vehicle-data.test.js
 node g-history.test.js
 node diag-probe.test.js
@@ -50,10 +60,16 @@ node diag-probe.test.js
 图层与带宽测试需要两个上游源码目录，默认查找本仓库旁边的 `idrive-apps` 与 `idrive7-apps`，也可显式指定：
 
 ```sh
-IDRIVE_APPS=/path/to/idrive-apps IDRIVE7_APPS=/path/to/idrive7-apps node vehicle-layout.test.js
+export IDRIVE_APPS=/path/to/idrive-apps IDRIVE7_APPS=/path/to/idrive7-apps
+node configured-render.test.js
+node vehicle-layout.test.js
 ```
 
+渲染测试默认查找相邻的 `simulator/profiles.js`，也可用 `SIMULATOR_DIR` 指定模拟器目录。缺少模拟器时使用合成驾驶数据。私有接口文件缺失时，仅跳过依赖这些文件的校验。
+
 ## 更新记录
+
+- **2026-11-27**：新增分栏与指标设置、中控实时同步、启动动画和 OBD 共存开关。
 
 - **2026-11-26（ROAD 方案 B + 温和共存 `v5` 实车通过）**：将普通模式重构为左 4 温度 / 中 4 胎加居中字标 / 右 3 压力三栏中轴对称布局并全部命中原生烘焙字号（车机缓存渲染提速至 14 ms）；针对全天通勤日志定位的 3.25 秒拒帧锁相问题及外接方向盘转速灯滞后现象，将常驻 `live` 调整为 3 秒常态节拍、拒帧完成时刻起 `1370/1890/2410/1630 ms` 错相退让与 25 秒保鲜期，经实车测试通过。
 - **2026-11-25**：实车 6 分钟路试验证单帧 5-DID 只读 UDS `0x22` 与外接设备共存，涡轮增压改走被动 `FES.displayBoostPressure`；上线三分区脏矩形 RGBA 上传、64 顶点 G 包络、粗体字库与 SPORT 实车硬裁切标定。

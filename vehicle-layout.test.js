@@ -3,31 +3,15 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
-const idriveApps = process.env.IDRIVE_APPS || path.resolve(__dirname, '../idrive-apps');
-const idrive7Apps = process.env.IDRIVE7_APPS || path.resolve(__dirname, '../idrive7-apps');
-const simulatorDir = path.resolve(process.env.SIMULATOR_DIR || path.join(__dirname, '../simulator'));
-const { ClusterRender } = require(path.join(idriveApps, 'native/cluster-render/js/cluster_render_client'));
-const { initial, sample } = process.env.SIMULATOR_DIR || fs.existsSync(simulatorDir)
-    ? require(path.join(simulatorDir, 'profiles'))
-    : {
-        // shortcut: synthetic SPORT inputs for the upload budget test, use SIMULATOR_DIR for full demo profiles.
-        initial: { iat: 35, gearbox: 82, pressureFL: 2.35, pressureFR: 2.36, pressureRL: 2.51,
-            pressureRR: 2.50, tyreFL: 36, tyreFR: 37, tyreRL: 39, tyreRR: 38 },
-        sample(state, seconds) {
-            return Object.assign({}, state, {
-                valid: true,
-                gLat: 0.65 * Math.sin(seconds / 2), gLong: 0.35 * Math.cos(seconds / 3),
-                oil: Math.round(98 + 3 * Math.sin(seconds / 20)),
-                coolant: Math.round(92 + 2 * Math.sin(seconds / 17)),
-                boost: 0.85 + 0.55 * Math.sin(seconds / 4),
-                oilPressure: 3.8 + 0.7 * Math.sin(seconds / 5),
-                fuelRail: Math.round(170 + 25 * Math.sin(seconds / 4))
-            });
-        }
-    };
+const { ClusterRender } = require(path.resolve(process.env.IDRIVE_APPS || path.join(__dirname, '../idrive-apps'), 'native/cluster-render/js/cluster_render_client'));
+const { initial, ranges, sample, update } = require('./test-profiles');
+const { catalog, defaults, dataCard, tyreCard } = require('./settings');
+const canvas = require(path.resolve(process.env.IDRIVE7_APPS || path.join(__dirname, '../idrive7-apps'), 'kit/runtime/canvas'));
+const { Canvas } = canvas;
 const { GHistory } = require('./g-history');
 const widget = require('./widget');
 let tick, modeChanged, client, probe, exitCode, renders = 0;
+let now = 10000, fixture, renderedSample;
 let paint = () => {};
 let sampleData = data => data;
 const watched = new Map(), handlers = {}, warnings = [];
@@ -67,16 +51,19 @@ const context = {
         if (name === './state') return { appState: () => ({ boot: 'test', load: () => null, save() {} }) };
         if (name.endsWith('/cluster_render_client')) return { ClusterRender: TestClient };
         if (name.endsWith('/widget.js')) return Object.assign({}, widget, {
-            render(canvas, sample) {
+            createData(storage) { return fixture || widget.createData(storage); },
+            render(canvas, sample, settings) {
+                renderedSample = sample;
                 renders++;
-                widget.render(canvas, sampleData(sample));
+                widget.render(canvas, sampleData(sample), settings);
                 paint(canvas);
             },
             createDiagProbe() {
                 probe = {
-                    visible: [], power: [], observed: [], started: false, stopped: false,
+                    visible: [], power: [], coexistence: [], observed: [], started: false, stopped: false,
                     setVisible(value) { this.visible.push(value); },
                     setPowerState(value) { this.power.push(value); },
+                    setCoexistence(value) { this.coexistence.push(value); },
                     observeStatus(key, value) { this.observed.push([key, value]); },
                     start(subscription) { this.started = subscription; },
                     stop() { this.stopped = true; },
@@ -90,18 +77,28 @@ const context = {
             if (fields.statusDisplayKombi) modeChanged = fields.statusDisplayKombi;
             if (fields.statusSwitchDriveDynamicSport2) throw Error('test missing FES config');
             if (fields.basicDataSet) return { error: 'test BasicDataSet unavailable', shutdown: async () => {} };
+            if (fields.AngleAcceleratorPedal) throw Error('test accelerator pedal unavailable');
             if (fields.StatusExtDiag) fields.StatusExtDiag({ statusConnectionHSFZ: 1 });
             if (fields.tasuModeStatus) fields.tasuModeStatus(0);
             return { shutdown: async () => {} };
         } };
-        if (name.endsWith('/canvas')) return require(path.join(idrive7Apps, 'kit/runtime/canvas'));
+        if (name.endsWith('/canvas')) return canvas;
         return name.startsWith('./') ? require(path.join(__dirname, name)) : require(name);
     },
-    module: { exports: {} }, __dirname, Buffer, console: { log() {}, error(message) { warnings.push(message); } },
+    Date: {now: () => now}, module: { exports: {} }, __dirname, Buffer, console: { log() {}, error(message) { warnings.push(message); } },
     process: { env: {}, on(name, fn) { handlers[name] = fn; }, exit(code) { exitCode = code; } },
     setInterval(fn, ms) { assert.strictEqual(ms, 100); tick = fn; return 1; }, clearInterval() {}, setTimeout() {}
 };
 (async () => {
+    if (ranges) for (const {key} of catalog) {
+        assert(Number.isFinite(sample(update(initial, {demo:false}), 0)[key]), key + ' manual initial value');
+        const values = [0, 5, 10, 30, 60].map(t => sample(initial, t)[key]);
+        assert(values.every(Number.isFinite) && new Set(values).size > 1, key + ' changing demo values');
+        if (key !== 'gTotal') {
+            assert(values.every(v => v >= ranges[key][0] && v <= ranges[key][1]), key + ' demo range');
+            assert.equal(sample(update(initial, {[key]:ranges[key][0], demo:false}), 0)[key], ranges[key][0]);
+        }
+    }
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, './framework/widgets/runtime.js'), 'utf8'), context);
     context.module.exports.run(__dirname, 'widget');
     for (let i = 0; i < 30 && !modeChanged; i++) await Promise.resolve();
@@ -222,12 +219,45 @@ const context = {
         assert(bytesInWindow <= 5500 * 1024,
             'SPORT demo data stays within the one-second upload budget');
     }
+    const preferences = require('./settings').defaults();
+    handlers.message({type: 'widget-settings', config: preferences});
+    const configuredFrame = client.uploads[client.uploads.length - 1];
+    assert(!configuredFrame.data.equals(replacement.data), 'settings IPC immediately changes the real widget output');
+    const savedShape = client.layers.get(configuredFrame.ref);
+    assert.equal(savedShape.opts.w, 760, 'settings do not replace the registered widget or resize its target');
+    for (const type of ['data', 'g']) {
+        const custom = require('./settings').defaults();
+        custom.modes.sport.columns = Array.from({length: 3}, () => type === 'data'
+            ? {type: 'data', metrics: ['oil', 'coolant', 'boost', 'fuelRail']} : {type: 'g'});
+        custom.modes.sport.primary = null;
+        handlers.message({type: 'widget-settings', config: custom});
+        const bytes = [];
+        for (let i = 0; i < 30; i++) {
+            const before = client.wireBytes;
+            tick(); frame++;
+            bytes.push(client.wireBytes - before);
+            if (bytes.length > 10) bytes.shift();
+            assert(bytes.reduce((a, b) => a + b, 0) <= 5500 * 1024, 'configured cards fit the one-second upload budget');
+        }
+    }
+    handlers.message({type: 'widget-settings', config: Object.assign({}, preferences, {obdCoexistence: true})});
+    assert.strictEqual(probe.coexistence[probe.coexistence.length - 1], true);
+    handlers.message({type: 'widget-settings', config: undefined});
+    assert.strictEqual(probe.coexistence[probe.coexistence.length - 1], false);
     sampleData = data => data;
 
-    for (let i = 0; i < 50 && !probe.started; i++) await Promise.resolve();
+    await new Promise(setImmediate);
     assert(probe.started);
     assert(warnings.some(w => w.includes('missing FES')) && warnings.some(w => w.includes('BasicDataSet unavailable')));
+    assert(warnings.some(w => w.includes('accelerator pedal unavailable')), 'missing new optional provider leaves the existing probe active');
     assert(watched.has('de.bmw.infotainment.vehicle.CDS') && watched.has('de.bmw.infotainment.vehicle.TPMS'));
+    const cds = watched.get('de.bmw.infotainment.vehicle.CDS').fields;
+    assert(cds.statusEngineTemperature && cds.statusEngineSpeed2 && cds.statusBattery2);
+    const vehicle = watched.get('de.bmw.infotainment.vehicle.Vehicle2').fields;
+    assert(vehicle.statusCarSpeed2 && vehicle.statusDisplayKombi, 'mode and speed share the Vehicle2 proxy');
+    assert(watched.get('de.bmw.chassis.SteeringAngle').fields.ActualSteeringAngleDriver);
+    assert(watched.get('de.bmw.infrastructure.EnvironmentalInformation').fields.ExteriorTemperature);
+    assert(watched.get('de.bmw.infotainment.KombiIF').fields.statusRangeTankStatus);
     const tasu = watched.get('com.harman.infotainment.systemfunctions.tasu.tasu.InternalTasu');
     assert.strictEqual(tasu.instance, 'SystemFunctionsInternalTasuInst1');
     assert.strictEqual(tasu.opts, undefined, 'TASU keeps its subscription without polling');
@@ -254,6 +284,105 @@ const context = {
     for (let i = 0; i < 30 && !modeChanged; i++) await Promise.resolve();
     modeChanged({ statusDisplayInstrumentPackM: 1 }); tick();
     assert.equal(Array.from(client.layers.values())[0].opts.target, 'widget1', 'same UI runs on a second registered target');
+    async function verifyReveal(mode, name, config) {
+        const sport = mode === 'sport', step = sport ? 100 : 200;
+        const start = now, state = Object.assign({}, initial, {mode});
+        const history = new GHistory(() => now);
+        let snapshot;
+        function advanceData() {
+            const live = sample(state, (now - start) / 1000);
+            snapshot = Object.freeze(Object.assign(live, history.sample(live.gLat, live.gLong, live.valid)));
+        }
+        advanceData();
+        fixture = {snapshot: () => snapshot};
+        modeChanged = null;
+        context.module.exports.run(__dirname, 'widget');
+        for (let i = 0; i < 30 && !modeChanged; i++) await Promise.resolve();
+        if (config) handlers.message({type:'widget-settings', config});
+        modeChanged({statusDisplayInstrumentPackM: sport ? 2 : 1});
+        const ref = client.uploads[0].ref, layer = client.layers.get(ref);
+        const control = new Canvas(layer.iw, layer.ih);
+        const buckets = [];
+        let lastBytes = 0, introPeak = 0, steadyPeak = 0;
+        assert.strictEqual(renderedSample, snapshot, 'before first appearance use the original snapshot');
+        client.layerState(ref, 'shown');
+        client.emit('target', 'widget1', 'shown');
+        assert.equal(client.uploads.length, 1);
+        client.emit('target', 'widget', 'shown');
+        assert.strictEqual(renderedSample.intro, 0);
+        for (let ms = 0; ms <= 5000; ms += 100) {
+            now = start + ms;
+            if (ms) { advanceData(); tick(); }
+            if (ms === 400 || ms === 1200) {
+                const before = renders;
+                client.emit('target', 'widget', 'offered');
+                client.emit('target', 'widget', 'shown');
+                assert.equal(renders, before, 'widget navigation never restarts the sweep');
+            }
+            if (ms % step === 0) {
+                if (ms <= 1000) assert.equal(renderedSample.intro, ms / 1000);
+                else assert.strictEqual(renderedSample, snapshot, 'steady state passes the original snapshot through');
+                // Reconstructing every normal draw also checks the final patch on the live layer.
+                widget.render(control, ms < 1000 ? Object.assign({}, snapshot, {intro:ms / 1000}) : snapshot, config);
+                assert(layer.image.equals(Buffer.from(control.d)), mode + ' patch reconstruction at ' + ms);
+            }
+            // The first window includes the full prewarm upload and the target-shown patch.
+            buckets.push(client.wireBytes - lastBytes);
+            lastBytes = client.wireBytes;
+            if (buckets.length > 10) buckets.shift();
+            const bytes = buckets.reduce((a, b) => a + b, 0);
+            if (ms < 2000) introPeak = Math.max(introPeak, bytes);
+            else steadyPeak = Math.max(steadyPeak, bytes);
+            assert(bytes <= 5500 * 1024, mode + ' ' + name + ' at ' + ms + ' ms: ' + bytes / 1024 + ' KiB/s');
+        }
+        const before = client.wireBytes;
+        for (let i = 0; i < 10; i++) tick();
+        assert.equal(client.wireBytes, before, 'unchanged data uploads zero bytes');
+        handlers.message({type:'power-state', state:'SLEEP_MODE_ALL_OFF'});
+        client.emit('target', 'widget', 'shown');
+        assert.strictEqual(renderedSample, snapshot);
+        handlers.message({type:'power-state', state:'FULL_ON_USER_ON'});
+        client.emit('target', 'widget', 'shown');
+        assert.equal(renderedSample.intro, 0, 'the next ignition rearms first appearance');
+        if (name === 'default') {
+            modeChanged({statusDisplayInstrumentPackM:'KEINE_AENDERUNG'});
+            const traffic = [client.wireBytes - before];
+            let deferred = false;
+            for (let ms = 100; ms <= 1800; ms += 100) {
+                now += 100;
+                const ink = [Math.min(ms / 100, 9), 0, 0, 255];
+                paint = canvas => canvas.clear(ink);
+                const previous = client.wireBytes;
+                tick();
+                traffic.push(client.wireBytes - previous);
+                if (traffic.length > 10) traffic.shift();
+                assert(traffic.reduce((a, b) => a + b, 0) <= 5500 * 1024, 'hard limit on full-surface changes');
+                if (ms % step === 0 && ms < 900 && layer.image[0] !== ink[0]) deferred = true;
+            }
+            assert(deferred, 'excess traffic was coalesced');
+            assert(layer.image.equals(Buffer.from(control.clear([9, 0, 0, 255]).d)), 'latest pixels arrive after saturation');
+            paint = () => {};
+        }
+        console.log(mode.toUpperCase() + ' ' + name + ' peak KiB/s: intro ' + (introPeak / 1024).toFixed(1) +
+            ', steady ' + (steadyPeak / 1024).toFixed(1) + ', unchanged 0');
+    }
+    for (const mode of ['road', 'sport']) {
+        await verifyReveal(mode, 'default', defaults());
+        await verifyReveal(mode, 'legacy', undefined);
+        for (const count of [1, 2]) {
+            const config = defaults();
+            config.modes[mode].primary = 0;
+            config.modes[mode].columns = Array.from({length:count}, () => ({type:'g'}));
+            await verifyReveal(mode, count + ' large G', config);
+        }
+        for (const type of ['bars', 'compact', 'g', 'tyres']) {
+            const config = defaults(), layout = config.modes[mode];
+            layout.primary = null;
+            layout.columns = [0, 1, 2].map(i => type === 'g' ? {type} : type === 'tyres' ? tyreCard() :
+                dataCard(type === 'bars' ? ['rpm', 'boost', 'torque', 'pedal'] : catalog.slice(i * 7, i * 7 + 7).map(m => m.key)));
+            await verifyReveal(mode, type, config);
+        }
+    }
     console.log('PASS: expanded ROAD/SPORT geometry and cadence, cold-start layer continuity, reconnect full frames, dirty RGBA, bandwidth, refusal recovery, subscriptions and IPC gate');
     console.log('SPORT peak one-second upload: ' + (peakBytes / 1024).toFixed(1) + ' KiB/s (limit 5500 KiB/s)');
 })().catch(e => { console.error(e); process.exitCode = 1; });

@@ -2,7 +2,9 @@
 // Shared drawing function for the preview and vehicle runner.
 // Drawing uses idrive7-apps' Canvas; pixels travel through the upstream ClusterRender client.
 const fs = require('fs');
+const style = require('./cluster-draw');
 const path = require('path');
+const { thresholdCatalog } = require('./settings');
 const { GHistory } = require('./g-history');
 const { text, textWidth } = require('./font-draw');
 const logo = require('./assets/logo.json');
@@ -26,9 +28,8 @@ for (let i = 0; i < titlePixels.length; i += 4) {
 }
 
 const C = {
-    text: '#ffffff', dim: '#d4e3f0', missing: '#7890a6', hot: '#ff4d45', blue: '#64bde9',
-    panel: '#050d1888', border: '#3b5c7d5c', guide: '#38557088', track: '#122334', fill: '#eaf2f8',
-    zero: '#8da9c2', gold: '#f0b46c', red: '#ef4039'
+    text: '#ffffff', dim: '#9ea8b8', missing: '#7890a6', hot: '#ff423d', blue: '#56b8ff',
+    zero: '#8da9c2', gold: '#f0b46c', red: '#e5202b'
 };
 const fmt = (v, n) => Number.isFinite(v) ? v.toFixed(n) : '--';
 const num = { font: 'num' };
@@ -100,10 +101,15 @@ const metrics = [
 const temperatureMetrics = metrics.slice(0, 4);
 const pressureMetrics = metrics.slice(4);
 
+const tyreLimits = {thresholds: {}};
+for (const t of thresholdCatalog) {
+    if (t.key === 'tyrePressure' || t.key === 'tyreTemp') tyreLimits.thresholds[t.key] = t.default;
+}
+
 const layouts = {
     road: {
         panels: [[48, 152, 314, 492], [376, 152, 368, 492], [758, 152, 314, 492]],
-        wheelX: [468, 652], wheelY: [248, 408], wheelGuide: [400, 720, 196, 464, 18], guideY: 328,
+        wheelX: [468, 652], wheelY: [248, 408], guideY: 328,
         pressureSize: 56, pressureUnit: 20, pressureGap: 6, tyreSize: 30, tyreUnit: 20, tyreOffset: 42,
         temperature: { left: 68, right: 342, top: 172, row: 116, size: 56, unitSize: 20, labelSize: 20,
             showBars: true, barHeight: 7, labelOffset: 48, valueOffset: 58, barOffset: 76, unitGap: 8 },
@@ -113,7 +119,7 @@ const layouts = {
     },
     sport: {
         panels: [[22, 154, 200, 394], [230, 154, 312, 394], [550, 154, 200, 394]],
-        wheelX: [74, 170], wheelY: [224, 352], wheelGuide: [36, 208, 178, 392, 14], guideY: 286,
+        wheelX: [74, 170], wheelY: [224, 352], guideY: 286,
         pressureSize: 40, pressureUnit: 15, pressureGap: 4, tyreSize: 26, tyreOffset: 32,
         power: { left: 562, right: 738, top: 166, row: 51, gap: 14, size: 38, unitSize: 15, labelSize: 16, showBars: false },
         mark: [150, 442, 122], statusY: 538
@@ -121,28 +127,26 @@ const layouts = {
 };
 
 function powertrain(cv, data, { left, right, top, row, gap = 0, size, unitSize, labelSize, showBars, barHeight,
-    labelOffset = 25, valueOffset = row * 0.64, barOffset, unitGap = 6 }, readings = metrics) {
+    labelOffset = 25, valueOffset = row * 0.64, barOffset, unitGap = 6 }, readings, anim) {
     const numberRight = right - textWidth('bar', unitSize) - unitGap;
     const barWidth = right - left;
     readings.forEach(([key, label, unit, decimals, min, max], index) => {
         const y = top + index * row + (index < 4 ? 0 : gap);
         const v = data.valid ? data[key] : null, live = Number.isFinite(v);
-        const style = key === 'oil' || key === 'coolant' ? temperatureStyle(key, v) : null;
-        const alert = style && style.label;
-        const color = live ? (alert ? style.color : C.text) : C.missing;
+        const thermal = key === 'oil' || key === 'coolant' ? temperatureStyle(key, v) : null;
+        const alert = thermal && thermal.label;
+        const color = live ? (alert ? thermal.color : C.text) : C.missing;
         const labelColor = live ? C.dim : C.missing;
         const baseline = y + valueOffset;
         const labelBaseline = y + labelOffset;
         text(cv, label, left, labelBaseline, labelSize, labelColor);
-        text(cv, fmt(v, decimals), numberRight, baseline, size, color, { font: 'num', align: 'right' });
+        text(cv, fmt(v, decimals), numberRight, baseline, size, anim ? style.opacity(color, anim.ink) : color, { font: 'num', align: 'right' });
         text(cv, unit, right, showBars ? baseline : labelBaseline, unitSize, labelColor, { align: 'right' });
         if (!showBars) return;
         const barY = y + barOffset;
-        cv.roundRect(left, barY, barWidth, barHeight, barHeight / 2, C.track);
-        if (live) {
-            const fraction = clamp((v - min) / (max - min), 0, 1);
-            cv.roundRect(left, barY, fraction * barWidth, barHeight, barHeight / 2, alert ? color : C.fill);
-        }
+        style.track(cv, left, barY, barWidth, barHeight);
+        const fraction = live ? clamp((v - min) / (max - min), 0, 1) : null;
+        style.bar(cv, left, barY, barWidth, barHeight, fraction, color, false, anim);
         if (key === 'boost' && live) {
             cv.fillRect(Math.round(left - min / (max - min) * barWidth), barY - 2, 1, barHeight + 4, C.zero);
         }
@@ -152,14 +156,15 @@ function powertrain(cv, data, { left, right, top, row, gap = 0, size, unitSize, 
 const gx = 386, gy = 298, r = 108;
 const scaleText = ['1g', gx + 40, gy - 72, 15, '#93afc7', {}];
 
-function gDirection(cv, value, x, y, align) {
+function gDirection(cv, value, x, y, align, size, anim) {
     const live = Number.isFinite(value);
     const active = live && value > 0.005;
-    text(cv, live ? fmt(active ? value : 0, 2) + 'g' : '--g', x, y, 16,
-        active ? '#eef6fd' : '#6f899f', { font: 'num', align });
+    const tint = active ? '#eef6fd' : '#8491a5';
+    text(cv, live ? fmt(active ? value : 0, 2) + 'g' : '--g', x, y, size,
+        anim ? style.opacity(tint, anim.ink) : tint, { font: 'num', align });
 }
 
-function gMeter(cv, data) {
+function gMeter(cv, data, { x: gx = 386, y: gy = 298, radius: r = 108, totalY = 512, totalSize = 48, directionSize = 16, directionGap = 0 } = {}, anim) {
     const gLat = data.valid && Number.isFinite(data.gLat) ? data.gLat : NaN;
     const gLong = data.valid && Number.isFinite(data.gLong) ? data.gLong : NaN;
     const envelope = data.gEnvelope || [];
@@ -179,70 +184,75 @@ function gMeter(cv, data) {
         cv.line(previous[0], previous[1], current[0], current[1], 3, C.red + alpha);
     }
     const live = Number.isFinite(gLat) && Number.isFinite(gLong);
-    if (live) {
+    if (live && (!anim || anim.puck > 0)) {
         const [x, y] = gPosition(gLat, gLong, gx, gy, r);
-        cv.circle(x, y, 15, C.red + '30');
-        cv.circle(x, y, 7, C.red);
-        cv.circle(x, y, 3, C.text);
+        const light = anim ? anim.puck : 1;
+        cv.circle(x, y, 15, style.opacity(C.red, light * 0.19));
+        cv.circle(x, y, 7, style.opacity(C.red, light));
+        cv.circle(x, y, 3, style.opacity(C.text, light));
     }
-    gDirection(cv, -gLong, gx, gy - r - 10, 'center');
-    gDirection(cv, gLong, gx, gy + r + 22, 'center');
-    gDirection(cv, gLat, gx - r - 5, gy + 6, 'right');
-    gDirection(cv, -gLat, gx + r + 5, gy + 6, 'left');
-    text(cv, fmt(Math.hypot(gLat, gLong), 2) + 'g', gx, 512, 48, live ? C.text : C.missing,
+    gDirection(cv, -gLong, gx, gy - r - 10 - directionGap, 'center', directionSize, anim);
+    gDirection(cv, gLong, gx, gy + r + 22 + directionGap, 'center', directionSize, anim);
+    gDirection(cv, gLat, gx - r - 5 - directionGap, gy + 6, 'right', directionSize, anim);
+    gDirection(cv, -gLat, gx + r + 5 + directionGap, gy + 6, 'left', directionSize, anim);
+    const tint = live ? C.text : C.missing;
+    text(cv, fmt(Math.hypot(gLat, gLong), 2) + 'g', gx, totalY, totalSize, anim ? style.opacity(tint, anim.ink) : tint,
         { font: 'num', align: 'center' });
 }
 
 function staticLayer(Canvas, w, h, layout, sport) {
     const layer = new Canvas(w, h);
-    for (const [x, y, width, height] of layout.panels) {
-        layer.roundRect(x, y, width, height, 14, C.panel);
-        layer.strokeRoundRect(x, y, width, height, 14, 1, C.border);
-    }
-    const [left, right, top, bottom, gap] = layout.wheelGuide;
-    const x = (layout.wheelX[0] + layout.wheelX[1]) / 2;
-    const y = layout.guideY;
-    layer.line(left, y, x - gap / 2, y, 1, C.guide);
-    layer.line(x + gap / 2, y, right, y, 1, C.guide);
-    layer.line(x, top, x, y - gap / 2, 1, C.guide);
-    layer.line(x, y + gap / 2, x, bottom, 1, C.guide);
+    const rects = layout.panels.map(([x, y, w, h]) => ({x, y, w, h}));
+    rects.forEach((r, i) => style.card(layer, r, sport && i === 1));
+    const body = style.chassis(layer, (layout.wheelX[0] + layout.wheelX[1]) / 2, layout.guideY, sport ? 0.85 : 1.1);
     if (sport) {
         const power = layout.power;
-        const separatorY = power.top + 4 * power.row + power.gap / 2 - 5;
-        layer.line(power.left, separatorY, power.right, separatorY, 1, C.guide);
-        layer.line(gx - r, gy, gx + r, gy, 1, '#2a4154');
-        layer.line(gx, gy - r, gx, gy + r, 1, '#2a4154');
-        layer.arc(gx, gy, r / 2 - 0.6, r / 2 + 0.6, 0, 360, '#334d63');
-        layer.arc(gx, gy, r - 1, r + 1, 0, 360, '#6f8fa8');
+        for (let i = 1; i < 7; i++) {
+            const y = power.top + i * power.row + (i >= 4 ? power.gap : 0) - 5;
+            layer.fillRect(power.left, y, power.right - power.left, 1, '#ffffff14');
+        }
+        style.dial(layer, gx, gy, r);
         text(layer, ...scaleText);
     }
     drawWordmark(layer, ...layout.mark);
-    return layer.d;
+    const base = layer.d.slice();
+    rects.forEach(r => style.accent(layer, r, sport, 1));
+    if (sport) style.rings(layer, gx, gy, r, 1);
+    return {pixels: layer.d, base, rects, body};
 }
 
 const staticPixels = {};
-function render(cv, data) {
+function render(cv, data, settings) {
+    if (settings) return require('./configured-render').render(cv, data, settings, { wheelReading, drawWordmark, gMeter });
     const sport = data.mode === 'sport';
     const mode = sport ? 'sport' : 'road', layout = layouts[mode];
     if (!staticPixels[mode]) staticPixels[mode] = staticLayer(cv.constructor, cv.w, cv.h, layout, sport);
-    cv.d.set(staticPixels[mode]);
+    const scene = staticPixels[mode], anim = data.intro < 1 && style.motion(data.intro);
+    cv.d.set(anim ? scene.base : scene.pixels);
+    if (anim) {
+        scene.rects.forEach(r => style.accent(cv, r, sport, anim.accent));
+        if (sport) style.rings(cv, gx, gy, r, anim.rings);
+    }
     const value = key => data.valid ? data[key] : null;
     ['FL', 'FR', 'RL', 'RR'].forEach((key, index) => {
         const x = layout.wheelX[index % 2], y = layout.wheelY[index >> 1];
         const pressure = value('pressure' + key), tyre = value('tyre' + key);
+        const p = style.tintFor('pressure' + key, pressure, tyreLimits);
+        const t = style.tintFor('tyre' + key, tyre, tyreLimits);
+        style.wheel(cv, scene.body, index, p, t, anim);
         wheelReading(cv, fmt(pressure, 1), 'bar', x, y, layout.pressureSize, layout.pressureUnit,
-            layout.pressureGap, Number.isFinite(pressure) ? C.text : C.missing);
+            layout.pressureGap, anim ? style.opacity(p, anim.ink) : p);
         wheelReading(cv, fmt(tyre, 0), '°C', x, y + layout.tyreOffset, layout.tyreSize, sport ? layout.tyreSize : layout.tyreUnit, 3,
-            Number.isFinite(tyre) ? C.dim : C.missing);
+            anim ? style.opacity(t, anim.ink) : t);
     });
     if (sport) {
         // Report cached text to observers on each frame, without redrawing its glyphs.
         if (typeof cv._onText === 'function') cv._onText(...scaleText);
-        gMeter(cv, data);
-        powertrain(cv, data, layout.power);
+        gMeter(cv, data, undefined, anim);
+        powertrain(cv, data, layout.power, metrics, anim);
     } else {
-        powertrain(cv, data, layout.temperature, temperatureMetrics);
-        powertrain(cv, data, layout.power, pressureMetrics);
+        powertrain(cv, data, layout.temperature, temperatureMetrics, anim);
+        powertrain(cv, data, layout.power, pressureMetrics, anim);
     }
     if (!data.valid) text(cv, data.stale ? 'DATA STALE' : 'NO DATA', layout.power.right, layout.statusY,
         16, C.hot, { align: 'right', spacing: 1 });

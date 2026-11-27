@@ -1,6 +1,9 @@
 'use strict';
 const assert = require('assert');
-const { VehicleData } = require('./vehicle-data');
+const { VehicleData, definitions } = require('./vehicle-data');
+const fs = require('fs');
+const path = require('path');
+const manifest = path.join(__dirname, 'someip-manifest.json');
 let now = 1000;
 const data = new VehicleData(() => now);
 assert.equal(data.snapshot('road').valid, false);
@@ -82,4 +85,64 @@ for (const [key, value] of [['iat', Infinity], ['oilPressure', -0.51], ['fuelRai
     powertrain.receiveDiag(key, value);
     assert.strictEqual(powertrain.snapshot('sport')[key], null, key);
 }
-console.log('PASS: passive conversion and fixed-zero handling, diagnostic ranges, precedence and independent expiry');
+const passive = new VehicleData(() => now);
+const extra = [
+    ['rpm', 'statusEngineSpeed2', 'actualValueRPMEngineCrankshaft', 12000, 3000, 65535],
+    ['speed', 'statusCarSpeed2', 'speedVehicleCentreOfGravity', 6400, 100, 65535],
+    ['torque', 'statusActualValueTorque2', 'actualValueTorqueCrankshaft', 2647, 300, 4095],
+    ['pedal', 'AngleAcceleratorPedal', 'actualValueAngleAcceleratorPedal', 2000, 50, 65535, 'qualifierActualValueAngleAcceleratorPedal'],
+    ['steer', 'ActualSteeringAngleDriver', 'actualValueSteeringAngleDriver', 64536, -43.95, 32767, 'qualifierActualValueSteeringAngleDriver'],
+    ['outside', 'ExteriorTemperature', 'temperatureExterior', 117, 18.5, 255],
+    ['battery', 'statusBattery2', 'conditionBatteryChargingCondition', 84, 84, 151],
+    ['tank', 'statusRangeTankStatus', 'fluidLevelFuelTank', 41, 41, 255],
+    ['range', 'statusRangeTankStatus', 'range', 452, 452, 4095]
+];
+for (const [key, field, member, raw, expected, invalid, qualifier] of extra) {
+    const def = definitions.find(d => d[1] === field), options = def[4];
+    assert(options.optional);
+    if (fs.existsSync(manifest)) {
+        assert.equal(require(manifest).proxies[def[0]].attributes[field], options.subscriptionOnly ? 's' : 'rs');
+    }
+    const file = path.join(__dirname, 'someipInterfaces', def[0].replace(/\./g, '_') + '.json');
+    const config = fs.existsSync(file) ? require(file) : null;
+    if (config) {
+        assert(config.fields[field].event, field);
+        assert.equal(!!config.fields[field].getter, !options.subscriptionOnly, field);
+    }
+    assert.strictEqual(passive.snapshot('road')[key], null, key);
+    const sample = value => qualifier ? {[member]:value, [qualifier]:1} : {[member]:value};
+    passive.receive(field, sample(invalid));
+    assert.strictEqual(passive.snapshot('road')[key], null, key);
+    passive.receive(field, sample(raw));
+    assert(Math.abs(passive.snapshot('road')[key] - expected) < 1e-9, key);
+    if (qualifier && config) {
+        const enums = config.fields[field].schema.e.find(m => m.n === qualifier).e;
+        const invalidQualifiers = Object.keys(enums).filter(name => !name.startsWith('SIGNALWERT_IST_GUELTIG'));
+        for (const value of invalidQualifiers.concat(invalidQualifiers.map(name => enums[name]), undefined)) {
+            passive.receive(field, {[member]:raw, [qualifier]:value});
+            assert.strictEqual(passive.snapshot('road')[key], null, key + ' qualifier ' + value);
+        }
+        const valid = Object.keys(enums).filter(name => name.startsWith('SIGNALWERT_IST_GUELTIG'));
+        for (const value of valid.concat(valid.map(name => enums[name]))) {
+            passive.receive(field, {[member]:raw, [qualifier]:value});
+            assert(Math.abs(passive.snapshot('road')[key] - expected) < 1e-9, key + ' qualifier ' + value);
+        }
+    }
+}
+passive.receive('statusRangeTankStatus', {fluidLevelFuelTank:41, range:452});
+assert.equal(passive.snapshot('road').tank, 41);
+assert.equal(passive.snapshot('road').range, 452);
+assert.equal(passive.snapshot('road').power, 300 * 3000 / 9549);
+passive.receive('statusActualValueTorque2', {actualValueTorqueCrankshaft:1847});
+assert.strictEqual(passive.snapshot('road').power, 0, 'engine braking has no positive power');
+passive.receive('statusActualValueTorque2', {actualValueTorqueCrankshaft:2647});
+passive.receive('ActualSteeringAngleDriver', {actualValueSteeringAngleDriver:-1000, qualifierActualValueSteeringAngleDriver:1});
+assert(Math.abs(passive.snapshot('road').steer + 43.95) < 1e-9, 'signed and encoded steering counts agree');
+now += 6001;
+assert.strictEqual(passive.snapshot('road').power, null);
+assert.strictEqual(passive.snapshot('road').rpm, null);
+assert.equal(passive.snapshot('road').battery, 84);
+now += 25001;
+assert.equal(passive.snapshot('road').valid, false);
+assert.equal(passive.snapshot('road').stale, true);
+console.log('PASS: optional SOME/IP subscriptions and scaling, signed steering, derived power, diagnostics and independent expiry');

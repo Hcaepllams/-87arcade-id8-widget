@@ -45,7 +45,17 @@ function text(cv, str, x, y, size, color, opts = {}) {
         const glyph = f.glyphs[ch.codePointAt(0)] || f.glyphs[63];
         if (!glyph) continue;
         const [gx, gy, gw, gh, ox, oy, adv] = glyph;
-        if (gw && gh) cv._blit(decoded, gx, gy, gw, gh, pen + ox * scale, y + oy * scale, scale, c);
+        if (scale === 1 && cv._blend) {
+            // Native-size glyphs need one atlas lookup per pixel, with no resampling.
+            const left = Math.ceil(pen + ox - 0.5), top = Math.ceil(y + oy - 0.5);
+            for (let row = 0; row < gh; row++) {
+                const src = (gy + row) * decoded.atlasW + gx;
+                for (let col = 0; col < gw; col++) {
+                    const coverage = decoded.alpha[src + col];
+                    if (coverage) cv._blend(left + col, top + row, c, coverage / 255);
+                }
+            }
+        } else if (gw && gh) cv._blit(decoded, gx, gy, gw, gh, pen + ox * scale, y + oy * scale, scale, c);
         pen += adv * scale + spacing;
     }
     return w;
